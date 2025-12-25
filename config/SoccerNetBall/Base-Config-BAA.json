@@ -1,9 +1,9 @@
 {
-    "frame_dir": "/Path/To/BAA/Dataset/224p",
-    "save_dir": "/Path/To/Project/save",
-    "store_dir": "/Path/To/BAA/Dataset/224p",
+    "frame_dir": "/home/guoxiangyu/pytorch_project/FAANTRA/data/soccernetball/224p/",
+    "store_dir": "/home/guoxiangyu/pytorch_project/FAANTRA/data/soccernetball/224p/",
+    "save_dir": "/home/guoxiangyu/pytorch_project/FAANTRA/save/",
     "store_mode": "load",
-    "batch_size": 4,
+    "batch_size": 8,
     "clip_len": 64,
     "dataset": "soccernetballanticipation",
     "radi_smoothing": 4,

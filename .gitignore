@@ -1,15 +1,29 @@
-venv
-__pycache__
-dataset/old*
-train_tdeed.py
-data/soccernetball/england_efl
-data/soccernetball/LEN*
-data/soccernetball-big/england_efl
-data/soccernetball-big/LEN*
-*.log
+# ===============================
+# Datasets & Training Outputs
+# ===============================
+data/
 save/
-logs/
-wandb/
 wandb_logs/
-T-Deed-Results/
+
+# ===============================
+# Python cache
+# ===============================
+__pycache__/
+*.pyc
+*.pyo
+
+# ===============================
+# Model checkpoints & logs
+# ===============================
+*.pth
+*.pt
+*.ckpt
+*.log
+
+# ===============================
+# OS / IDE
+# ===============================
 .vscode/
+.idea/
+.DS_Store
+
