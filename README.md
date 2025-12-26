@@ -1,4 +1,4 @@
-# FAANTRA
+# FAANTRA(The Res_test==17.43)
 Source code for the Football Action ANticipation Transformer (FAANTRA) for action anticipation in football broadcast videos. This repository contains the training and evaluation code used in the "Anticipation from SoccerNet Football Video Broadcasts" [paper](https://openaccess.thecvf.com/content/CVPR2025W/CVSPORTS/html/Dalal_Action_Anticipation_from_SoccerNet_Football_Video_Broadcasts_CVPRW_2025_paper.html).
 
 ![FAANTRA Architecture](assets/modelArchitecture-white.png)
