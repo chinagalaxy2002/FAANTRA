@@ -13,11 +13,11 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
           model_save_path, pad_idx, device, num_pred_frames, n_class, class_dict, n_query,
           start_epoch=0, offset_loss_weight=1.0, use_actionness=False, use_anchors=False,
           loss_func="CE", best_mAP = 0, best_model_path=""):
-    torch.autograd.set_detect_anomaly(True)     # Detects if NaNs are present in backpropagation. Disable for faster training.
+    torch.autograd.set_detect_anomaly(True)
     inv_class_dict = {v: k for k, v in class_dict.items()}
     num_pred_frames = int(num_pred_frames // n_query) if use_anchors else num_pred_frames
     BCE_with_actionness = loss_func == "BCE" and use_actionness
-    if BCE_with_actionness: use_actionness = False               # Force actionness off, because BCE is made to replace it
+    if BCE_with_actionness: use_actionness = False
     model.to(device)
     model.train()
     best_mAP = best_mAP
@@ -43,50 +43,71 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
         total_off_correct = 0
         total_seg = 0
         total_seg_correct = 0
+        
         train_loop = tqdm(train_loader)
+        
         for i, data in enumerate(train_loop):
+            if i >= 5:
+                print("【DEBUG模式】强制跳出训练循环，进入验证阶段...")
+                break 
             step_log_dict = {"train/step": epoch*len(train_loader) + i+1}
             postfix_kwargs = {"loss": 0}
             optimizer.zero_grad()
+            
+            # 1. 解包
             features, past_label, trans_off_future, trans_future_target, target_actionness = data
-            features = features.to(device) #[B, S, C]
-            past_label = past_label.to(device) #[B, S]
+            features = features.to(device)
+            past_label = past_label.to(device)
             trans_off_future = trans_off_future.to(device)
             trans_future_target = trans_future_target.to(device)
-            trans_off_future_mask = (trans_off_future != pad_idx).long().to(device) # Mask off padding in ground truth predictions. Not relevant when using background
             target_actionness = target_actionness.to(device)
 
-            target_off = trans_off_future*trans_off_future_mask # Mask off padding in ground truth offsets. Not relevant when using background
+            # 2. 预处理 Targets
+            trans_off_future_mask = (trans_off_future != pad_idx).long().to(device) 
+            target_off = trans_off_future * trans_off_future_mask 
             target = trans_future_target
-            inputs = (features, past_label)
+            
+            # 3. 构造 Diffusion 输入
+            targets_dict = {
+                'action': target,
+                'offset': target_off,
+                'actionness': target_actionness if (use_actionness or BCE_with_actionness) else None
+            }
+            inputs = (features, targets_dict)
 
-            outputs = model(inputs)
+            # 4. Forward
+            outputs = model(inputs, mode='train')
             losses = 0
 
-            ########################################
-            # Past segmentation (Auxilary task)
-            ########################################
-            if args.seg :
+            # Diffusion 逻辑判断
+            is_diffusion = 'loss' in outputs
+            
+            if is_diffusion:
+                diff_loss = outputs['loss']
+                losses += diff_loss
+                step_log_dict["train/diff_loss"] = diff_loss.item()
+                postfix_kwargs["loss_diff"] = diff_loss.item()
+            
+            # Seg Task
+            if args.seg and 'seg' in outputs:
                 output_seg = outputs['seg']
                 B, T, C = output_seg.size()
-                output_seg = output_seg.view(-1, C).to(device)
-                target_past_label = past_label.view(-1)
+                # [Fix] use reshape
+                output_seg = output_seg.reshape(-1, C).to(device)
+                target_past_label = past_label.reshape(-1) 
                 class_weights = torch.tensor(args.class_weights, device=device)
-                # Calculate loss and accuracy
                 loss_seg, n_seg_correct, n_seg_total, seg_class_stats = cal_performance(output_seg, target_past_label, pad_idx, class_weights=class_weights)
                 losses += loss_seg
                 total_seg += n_seg_total
                 total_seg_correct += n_seg_correct
                 epoch_loss_seg += loss_seg.item()
                 step_log_dict["train/seg_loss"] = loss_seg.item()
-                postfix_kwargs["loss_seg"] = loss_seg.item()
-                # Record loss, accuracy and class-wise statistics for auxilary task
+                
                 if n_seg_total == 0:
                     step_log_dict["train/seg_acc"] = 1
-                    postfix_kwargs["acc_seg"] = 1
                 else:
                     step_log_dict["train/seg_acc"] = n_seg_correct/n_seg_total
-                    postfix_kwargs["acc_seg"] = n_seg_correct/n_seg_total
+                    
                 if epoch_class_stats_seg is None:
                     epoch_class_stats_seg = seg_class_stats
                 else:
@@ -94,16 +115,11 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                         for class_stat in seg_class_stats[class_key].keys():
                             epoch_class_stats_seg[class_key][class_stat] += seg_class_stats[class_key][class_stat]
             
-            ########################################
-            # Future anticipation (Main task)
-            ########################################
-            if args.anticipate :
-                ########################################
-                # Prediction processing
-                ########################################
+            # Anticipation Task
+            if args.anticipate:
+                do_calc_loss = not is_diffusion 
+
                 output = outputs['action']
-                B, T, C = output.size()
-                # Perform CALF matching of predictions and ground truth if needed
                 if args.CALF_matching:
                     if args.CALF_probability_matching:
                         output, output_off, output_actionness = CALF_matching2(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
@@ -113,45 +129,63 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                         output, output_off, output_actionness = CALF_matching(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
                                                                               output_actionness=outputs['actionness'] if use_actionness else None,
                                                                               target_actionness=target_actionness if use_actionness else None)
-                output = output.view(-1, C).to(device)
-                target = target.contiguous().view(-1)
-                # Shift target by 1 if using actionness, so that it matches the predictions that do not have background/eos class
-                # Does not shift padding predictions
-                target = torch.where(target == pad_idx, target, target - 1) if use_actionness or BCE_with_actionness else target       # If using Actionness, then it moves target values back by one to compensate for lack of EOS
-                class_weights = torch.tensor(args.class_weights, device=device)
-                class_weights[0] = args.eos_weight  # Replace background weight with EOS weight
-                # Calculate prediction loss and accuracy
-                if use_actionness or BCE_with_actionness:
-                    loss, n_correct, n_total, class_stats = cal_performance(output, target, pad_idx, loss_func=loss_func, class_weights=class_weights[1:], actionness=True)
                 else:
-                    loss, n_correct, n_total, class_stats = cal_performance(output, target, pad_idx, loss_func=loss_func, class_weights=class_weights, actionness=use_actionness)
+                    output_off = outputs['offset']
+                    if use_actionness: output_actionness = outputs['actionness']
+
+                B, T, C = output.size()
+                # [Fix] use reshape
+                output = output.reshape(-1, C).to(device)
+                target = target.contiguous().view(-1)
+
+                target = torch.where(target == pad_idx, target, target - 1) if use_actionness or BCE_with_actionness else target
+                class_weights = torch.tensor(args.class_weights, device=device)
+                class_weights[0] = args.eos_weight
+                
+                if use_actionness or BCE_with_actionness:
+                    # 切片 output，去掉背景类，与 10 类权重对齐
+                    output_for_loss = output[:, 1:]
+                    loss, n_correct, n_total, class_stats = cal_performance(output_for_loss, target, pad_idx, loss_func=loss_func, class_weights=class_weights[1:], actionness=True, calc_loss=do_calc_loss)
+                    
+                    # 修正 class_stats 的 Key
+                    new_stats = {}
+                    for k, v in class_stats.items():
+                        new_stats[k+1] = v
+                    class_stats = new_stats
+
+                else:
+                    loss, n_correct, n_total, class_stats = cal_performance(output, target, pad_idx, loss_func=loss_func, class_weights=class_weights, actionness=use_actionness, calc_loss=do_calc_loss)
+                
                 acc = 1 if n_total == 0 else n_correct / n_total
-                # Actionness gets NaN CE_loss at the start of an epoch and I do not know why.
-                # So this is how I chose to sweep the issue under the rug
-                loss = torch.nan_to_num(loss)
-                losses += loss
+                
+                if not is_diffusion:
+                    loss = torch.nan_to_num(loss)
+                    losses += loss
+                    step_log_dict["train/CE_loss"] = loss.item()
+                    postfix_kwargs["loss_CE"] = loss.item()
+
                 total_class += n_total
                 total_class_correct += n_correct
-                epoch_loss_class += loss.item()
-
-                ########################################
+                if not is_diffusion: epoch_loss_class += loss.item()
+                
                 # Offset processing
-                ########################################
                 output_off = output_off if args.CALF_matching else outputs['offset']
-                # Normalize offset to be between 0-1 instead of 0-num_frames
                 transformed_output_off = normalize_offset(output_off, trans_off_future_mask, num_pred_frames)
                 transformed_target_off = normalize_offset(target_off, trans_off_future_mask, num_pred_frames)
-                # Calculate offset loss and 1s accuracy
-                if torch.sum(trans_off_future_mask) == 0:
-                    loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off))     # Due to trans_off_future_mask, this will be 0, as both vectors are fully 0
-                else:
-                    loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / \
-                    torch.sum(trans_off_future_mask)
-                loss_off *= offset_loss_weight
-                losses += loss_off
-                epoch_loss_off += loss_off.item()
-                # Get offset accuracy in 1 second intervals
-                unrolled_output_off = output_off.view(-1)
+                
+                if not is_diffusion:
+                    if torch.sum(trans_off_future_mask) == 0:
+                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off))
+                    else:
+                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / torch.sum(trans_off_future_mask)
+                    loss_off *= offset_loss_weight
+                    losses += loss_off
+                    epoch_loss_off += loss_off.item()
+                    step_log_dict["train/offset_loss"] = loss_off.item()
+
+                # Offset Accuracy
+                # [Fix] use reshape
+                unrolled_output_off = output_off.reshape(-1)
                 unrolled_target_off = target_off.view(-1)
                 unrolled_off_mask = trans_off_future_mask.view(-1)
                 off_correct = 0
@@ -160,36 +194,36 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                         if (unrolled_output_off[d] - unrolled_target_off[d]).abs() <= FPS_SN/STRIDE_SNB:
                             off_correct += 1
                 
-                ########################################
-                # Actionness processing
-                ########################################
+                # Actionness
                 if use_actionness:
-                    # Calculate actionness loss
                     output_actionness = output_actionness if args.CALF_matching else outputs['actionness']
-                    output_actionness = output_actionness.view(-1).to(device)
+                    # [Fix] use reshape (这是您报错的地方之一)
+                    output_actionness = output_actionness.reshape(-1).to(device)
                     target_actionness = target_actionness.contiguous().view(-1)
                     actionness_loss, actionness_stats = cal_actionness_performance(output_actionness, target_actionness, threshold=0.5)
-                    losses += actionness_loss
-                    epoch_loss_actionness += actionness_loss.item()
+                    
+                    if not is_diffusion:
+                        losses += actionness_loss
+                        epoch_loss_actionness += actionness_loss.item()
+                    
+                    total = actionness_stats["TP"] + actionness_stats["TN"] + actionness_stats["FP"] + actionness_stats["FN"]
+                    step_log_dict["train/actionness_acc"] = (actionness_stats["TP"] + actionness_stats["TN"]) / total if total > 0 else 0
+                    postfix_kwargs["acc_actionness"] = (actionness_stats["TP"] + actionness_stats["TN"]) / (total + 1e-8)
 
-                # Record and display main task training statistics
+                # Stats update
                 total_off_correct += off_correct
                 step_log_dict["train/CE_acc"] = acc
-                step_log_dict["train/CE_loss"] = loss.item()
-                step_log_dict["train/offset_loss"] = loss_off.item()
                 step_log_dict["train/offset_acc@1s"] = 1 if n_total == 0 else off_correct/n_total
-                if use_actionness: step_log_dict["train/actionness_acc"] = (actionness_stats["TP"] + actionness_stats["TN"]) / (actionness_stats["TP"] + actionness_stats["FN"] + actionness_stats["FP"] + actionness_stats["TN"])
-                postfix_kwargs["loss_CE"] = loss.item()
-                postfix_kwargs["loss_offset"] = loss_off.item()
                 postfix_kwargs["acc_ant"] = acc
                 postfix_kwargs["acc_offset"] = 1 if n_total == 0 else off_correct/n_total
-                if use_actionness: postfix_kwargs["acc_actionness"] = (actionness_stats["TP"] + actionness_stats["TN"]) / (actionness_stats["TP"] + actionness_stats["FN"] + actionness_stats["FP"] + actionness_stats["TN"])
+
                 if epoch_class_stats is None:
                     epoch_class_stats = class_stats
                 else:
                     for class_key in class_stats.keys():
                         for class_stat in class_stats[class_key].keys():
                             epoch_class_stats[class_key][class_stat] += class_stats[class_key][class_stat]
+                
                 if use_actionness:
                     if epoch_actionness_stats is None:
                         epoch_actionness_stats = actionness_stats
@@ -197,16 +231,17 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                         for stat_key in actionness_stats.keys():
                             epoch_actionness_stats[stat_key] += actionness_stats[stat_key]
 
-            # Back propagate loss
+            # Backprop
             epoch_loss += losses.item()
             losses.backward()
             optimizer.step()
-            # Record and display full training statistics for the iteration
+            
             step_log_dict["train/full_loss"] = losses.item()
             postfix_kwargs["loss"] = losses.item()
             train_loop.set_description(f"Epoch [{epoch+1}/{args.epochs}]")
             train_loop.set_postfix(**postfix_kwargs)
             step_log_dict["train/lr"] = optimizer.param_groups[0]['lr']
+            
             if args.seg:
                 inv_class_dict[0] = "BACKGROUND"
                 step_log_dict = log_class_metrics(step_log_dict, seg_class_stats, "train/seg", inv_class_dict)
@@ -236,50 +271,46 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
         val_total_seg = 0
         val_total_seg_correct = 0
         val_loop = tqdm(val_loader)
+        
         with torch.no_grad():
             for j, data in enumerate(val_loop):
-                #print(j)
                 step_log_dict = {"val/step": epoch*len(val_loader) + j+1}
                 postfix_kwargs = {"loss": 0}
                 features, past_label, trans_off_future, trans_future_target, target_actionness = data
-                features = features.to(device) #[B, S, C]
-                past_label = past_label.to(device) #[B, S]
+                features = features.to(device)
+                past_label = past_label.to(device)
                 trans_off_future = trans_off_future.to(device)
                 trans_future_target = trans_future_target.to(device)
-                trans_off_future_mask = (trans_off_future != pad_idx).long().to(device) # Mask off padding in ground truth predictions. Not relevant when using background
+                trans_off_future_mask = (trans_off_future != pad_idx).long().to(device) 
                 target_actionness = target_actionness.to(device)
 
-                target_off = trans_off_future*trans_off_future_mask # Mask off padding in ground truth offsets. Not relevant when using background
+                target_off = trans_off_future*trans_off_future_mask 
                 target = trans_future_target
                 inputs = features
 
                 outputs = model(inputs, mode="validation")
                 losses = 0
                 
-                ########################################
-                # Past segmentation (Auxilary task)
-                ########################################
-                if args.seg :
+                # Seg Task
+                if args.seg and 'seg' in outputs:
                     output_seg = outputs['seg']
                     B, T, C = output_seg.size()
-                    output_seg = output_seg.view(-1, C).to(device)
-                    target_past_label = past_label.view(-1)
+                    # [Fix] use reshape
+                    output_seg = output_seg.reshape(-1, C).to(device)
+                    target_past_label = past_label.reshape(-1)
                     class_weights = torch.tensor(args.class_weights, device=device)
-                    # Calculate loss and accuracy
                     loss_seg, n_seg_correct, n_seg_total, seg_class_stats = cal_performance(output_seg, target_past_label, pad_idx, class_weights=class_weights)
                     losses += loss_seg
                     val_total_seg += n_seg_total
                     val_total_seg_correct += n_seg_correct
                     val_epoch_loss_seg += loss_seg.item()
                     step_log_dict["val/seg_loss"] = loss_seg.item()
-                    postfix_kwargs["loss_seg"] = loss_seg.item()
-                    # Record loss, accuracy and class-wise statistics for auxilary task
+                    
                     if n_seg_total == 0:
                         step_log_dict["val/seg_acc"] = 1
-                        postfix_kwargs["acc_seg"] = 1
                     else:
                         step_log_dict["val/seg_acc"] = n_seg_correct/n_seg_total
-                        postfix_kwargs["acc_seg"] = n_seg_correct/n_seg_total
+                    
                     if val_epoch_class_stats_seg is None:
                         val_epoch_class_stats_seg = seg_class_stats
                     else:
@@ -287,15 +318,9 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                             for class_stat in seg_class_stats[class_key].keys():
                                 val_epoch_class_stats_seg[class_key][class_stat] += seg_class_stats[class_key][class_stat]
                 
-                ########################################
-                # Future anticipation (Main task)
-                ########################################
+                # Anticipation Task
                 if args.anticipate:
-                    ########################################
-                    # Prediction processing
-                    ########################################
                     output = outputs['action']
-                    # Perform CALF matching of predictions and ground truth if needed
                     if args.CALF_matching:
                         if args.CALF_probability_matching:
                             output, output_off, output_actionness = CALF_matching2(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
@@ -305,46 +330,57 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                             output, output_off, output_actionness = CALF_matching(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
                                                                                   output_actionness=outputs['actionness'] if use_actionness else None,
                                                                                   target_actionness=target_actionness if use_actionness else None)
+                    else:
+                        output_off = outputs['offset']
+                        if use_actionness: output_actionness = outputs['actionness']
+
                     B, T, C = output.size()
-                    output = output.view(-1, C).to(device)
+                    
+                    # [Fix] use reshape
+                    output = output.reshape(-1, C).to(device)
                     target = target.contiguous().view(-1)
-                    # Shift target by 1 if using actionness, so that it matches the predictions that do not have background/eos class
-                    # Does not shift padding predictions
+                    
                     target = torch.where(target == pad_idx, target, target - 1) if use_actionness or BCE_with_actionness else target
                     class_weights = torch.tensor(args.class_weights, device=device)
-                    class_weights[0] = args.eos_weight  # Replace background weight with EOS weight
-                    # Calculate prediction loss and accuracy
+                    class_weights[0] = args.eos_weight
+                    
                     if use_actionness or BCE_with_actionness:
-                        loss, n_correct, n_total, class_stats = cal_performance(output, target, pad_idx, loss_func=loss_func, class_weights=class_weights[1:], actionness=True)
+                        # 切片 output，去掉背景类，与 10 类权重对齐 (Loss计算用)
+                        output_for_loss = output[:, 1:]
+                        loss, n_correct, n_total, class_stats = cal_performance(output_for_loss, target, pad_idx, loss_func=loss_func, class_weights=class_weights[1:], actionness=True)
+                        
+                        # 修正 class_stats 的 Key
+                        new_stats = {}
+                        for k, v in class_stats.items():
+                            new_stats[k+1] = v
+                        class_stats = new_stats
+
                     else:
                         loss, n_correct, n_total, class_stats = cal_performance(output, target, pad_idx, loss_func=loss_func, class_weights=class_weights, actionness=use_actionness)
+                    
                     acc = 1 if n_total == 0 else n_correct / n_total
-                    # Actionness gets NaN CE_loss at the start of an epoch and I do not know why.
-                    # So this is how I chose to sweep the issue under the rug
+                    
                     loss = torch.nan_to_num(loss)
                     losses += loss
                     val_total_class += n_total
                     val_total_class_correct += n_correct
                     val_epoch_loss_class += loss.item()
 
-                    ########################################
-                    # Offset processing
-                    ########################################
+                    # Offset
                     output_off = output_off if args.CALF_matching else outputs['offset']
-                    # Normalize offset to be between 0-1 instead of 0-num_frames
                     transformed_output_off = normalize_offset(output_off, trans_off_future_mask, num_pred_frames)
                     transformed_target_off = normalize_offset(target_off, trans_off_future_mask, num_pred_frames)
-                    # Calculate offset loss and 1s accuracy
+                    
                     if torch.sum(trans_off_future_mask) == 0:
                         loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off))
                     else:
-                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / \
-                        torch.sum(trans_off_future_mask)
+                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / torch.sum(trans_off_future_mask)
                     loss_off *= offset_loss_weight
                     losses += loss_off
                     val_epoch_loss_off += loss_off.item()
-                    # Get offset accuracy in 1 second intervals
-                    unrolled_output_off = output_off.view(-1)
+                    
+                    # [Fix] use reshape
+                    unrolled_output_off = output_off.reshape(-1)
                     unrolled_target_off = target_off.view(-1)
                     unrolled_off_mask = trans_off_future_mask.view(-1)
                     off_correct = 0
@@ -353,30 +389,22 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                             if (unrolled_output_off[d] - unrolled_target_off[d]).abs() <= 25/STRIDE_SNB:
                                 off_correct += 1
                     
-                    ########################################
-                    # Actionness processing
-                    ########################################
+                    # Actionness
                     if use_actionness:
-                        # Calculate actionness loss
                         output_actionness = output_actionness if args.CALF_matching else outputs['actionness']
-                        output_actionness = output_actionness.view(-1).to(device)
+                        # [Fix] use reshape (这是您之前报错的地方，必须改)
+                        output_actionness = output_actionness.reshape(-1).to(device)
                         target_actionness = target_actionness.contiguous().view(-1)
                         actionness_loss, actionness_stats = cal_actionness_performance(output_actionness, target_actionness, threshold=0.5)
                         losses += actionness_loss
                         val_epoch_loss_actionness += actionness_loss.item()
 
-                    # Record and display main task training statistics
                     val_total_off_correct += off_correct
                     step_log_dict["val/CE_acc"] = acc
                     step_log_dict["val/CE_loss"] = loss.item()
                     step_log_dict["val/offset_loss"] = loss_off.item()
                     step_log_dict["val/offset_acc@1s"] = 1 if n_total == 0 else off_correct/n_total
-                    if use_actionness: step_log_dict["val/actionness_acc"] = (actionness_stats["TP"] + actionness_stats["TN"]) / (actionness_stats["TP"] + actionness_stats["FN"] + actionness_stats["FP"] + actionness_stats["TN"])
-                    postfix_kwargs["loss_CE"] = loss.item()
-                    postfix_kwargs["loss_offset"] = loss_off.item()
-                    postfix_kwargs["acc_ant"] = acc
-                    postfix_kwargs["acc_offset"] = 1 if n_total == 0 else off_correct/n_total
-                    if use_actionness: postfix_kwargs["acc_actionness"] = (actionness_stats["TP"] + actionness_stats["TN"]) / (actionness_stats["TP"] + actionness_stats["FN"] + actionness_stats["FP"] + actionness_stats["TN"])
+                    
                     if val_epoch_class_stats is None:
                         val_epoch_class_stats = class_stats
                     else:
@@ -391,7 +419,6 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                                 val_epoch_actionness_stats[stat_key] += actionness_stats[stat_key]
 
 
-                # Record and display full training statistics for the iteration
                 val_epoch_loss += losses.item()
                 step_log_dict["val/full_loss"] = losses.item()
                 postfix_kwargs["loss"] = losses.item()
@@ -414,9 +441,9 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
         epoch_log_dict = {"epoch": epoch+1, "epoch/full_loss": epoch_loss, "epoch/val_full_loss": val_epoch_loss}
         if args.anticipate :
             inv_class_dict[0] = "EOS"
-            accuracy = total_class_correct/total_class
+            accuracy = total_class_correct/total_class if total_class > 0 else 0
             epoch_loss_class = epoch_loss_class / (i+1)
-            val_accuracy = val_total_class_correct/val_total_class
+            val_accuracy = val_total_class_correct/val_total_class if val_total_class > 0 else 0
             val_epoch_loss_class = val_epoch_loss_class / (j+1)
             print('Training Acc :%.3f'%accuracy, 'CE loss :%.3f'%epoch_loss_class )
             print('Val Acc :%.3f'%val_accuracy, 'CE loss :%.3f'%val_epoch_loss_class )
@@ -425,9 +452,9 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
             epoch_log_dict["epoch/val_CE_acc"] = val_accuracy
             epoch_log_dict["epoch/val_CE_loss"] = val_epoch_loss_class
             epoch_loss_off = epoch_loss_off / (i+1)
-            offset_acc = total_off_correct / total_class
+            offset_acc = total_off_correct / total_class if total_class > 0 else 0
             val_epoch_loss_off = val_epoch_loss_off / (j+1)
-            val_offset_acc = val_total_off_correct / val_total_class
+            val_offset_acc = val_total_off_correct / val_total_class if val_total_class > 0 else 0
             print('offset acc:%.5f'%offset_acc,'offset loss: %.5f'%epoch_loss_off)
             print('val offset acc:%.5f'%val_offset_acc,'val offset loss: %.5f'%val_epoch_loss_off)
             epoch_log_dict["epoch/offset_loss"] = epoch_loss_off
@@ -446,8 +473,8 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
 
         if args.seg :
             inv_class_dict[0] = "BACKGROUND"
-            acc_seg = total_seg_correct / total_seg
-            val_acc_seg = val_total_seg_correct / val_total_seg
+            acc_seg = total_seg_correct / total_seg if total_seg > 0 else 0
+            val_acc_seg = val_total_seg_correct / val_total_seg if val_total_seg > 0 else 0
             epoch_loss_seg = epoch_loss_seg / (i+1)
             val_epoch_loss_seg = val_epoch_loss_seg / (j+1)
             print('seg loss :%.3f'%epoch_loss_seg, ', seg acc : %.5f'%acc_seg)
@@ -467,7 +494,7 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
         save_path = os.path.join(model_save_path)
         if not os.path.exists(save_path):
             os.makedirs(save_path)
-        # Evaluate model only after start_map_epoch
+        
         if epoch >= args.start_map_epoch:
             if args.anticipate:
                 if args.dataset == 'soccernetballanticipation':
@@ -478,16 +505,15 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                     print(key)
                     print(maps[key])
                     epoch_log_dict[f"epoch/map_{key}"] = maps[key]
-            # Save a checkpoint for safety
+            
             torch.save(model.state_dict(), os.path.join(save_path, f'checkpoint{epoch+1}.ckpt'))
-            # Save the best checkpoint with highest stable tightV2 mAP (Average of 1s, 5s and infinity mAP)
             if maps["tightV2"]["a_mAP_stable"] >= best_mAP:
                 print(f"\nSaving new best model at epoch {epoch+1} with mAP {maps['tightV2']['a_mAP_stable']} (+{maps['tightV2']['a_mAP_stable']-best_mAP})\n")
                 best_model_path = os.path.join(save_path, 'best_checkpoint.ckpt')
                 torch.save(model.state_dict(), best_model_path)
-                wandb.save(best_model_path) # Save best checkpoint on wandb. No other checkpoints are uploaded
+                wandb.save(best_model_path)
                 best_mAP = maps["tightV2"]["a_mAP_stable"]
-        # Save a checkpoint with all necessary information to resume training
+                
         checkpoint_dir = os.path.join(save_path, "checkpoint")
         os.makedirs(checkpoint_dir, exist_ok=True)
         torch.save({
@@ -500,18 +526,18 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
             "best_mAP": best_mAP,
             "best_model_path": best_model_path
         }, os.path.join(checkpoint_dir, "checkpoint.ckpt"))
-        # Log statistics on wandb
         wandb.log(epoch_log_dict)
         
     return model, best_model_path
 
-# Logs the class-wise statistics into the wandb dictionary
 def log_class_metrics(log_dict, class_stats, log_prefix, inv_class_dict):
     for class_key in class_stats.keys():
+        if class_key not in inv_class_dict:
+            inv_class_dict[class_key] = f"Unknown_Class_{class_key}"
+            
         for class_stat in class_stats[class_key].keys():
             log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/{class_stat}"] = class_stats[class_key][class_stat]
         if (class_stats[class_key]["TP"] + class_stats[class_key]["FP"] + class_stats[class_key]["TN"] + class_stats[class_key]["FN"]) == 0:
-            # If no samples of this class were present, we can't calculate any metrics
             continue
         log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/acc"] = (class_stats[class_key]["TP"] + class_stats[class_key]["TN"]) / (class_stats[class_key]["TP"] + class_stats[class_key]["FP"] + class_stats[class_key]["TN"] + class_stats[class_key]["FN"])
         log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/Prevalence"] = (class_stats[class_key]["TP"]) / (class_stats[class_key]["TP"] + class_stats[class_key]["FP"] + class_stats[class_key]["TN"] + class_stats[class_key]["FN"])
@@ -529,12 +555,10 @@ def log_class_metrics(log_dict, class_stats, log_prefix, inv_class_dict):
             log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/f1"] = 0 if class_stats[class_key]["TP"] == 0 else 2 * (log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/precision"] * log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/recall"]) / (log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/precision"] + log_dict[f"{log_prefix}/{inv_class_dict[class_key]}/recall"])
     return log_dict
 
-# Logs the confusion matrix into the wandb dictionary
 def log_confusion_matrix(log_dict, confusion_matrix, log_prefix):
     for metric in confusion_matrix.keys():
         log_dict[f"{log_prefix}/{metric}"] = confusion_matrix[metric]
     if (confusion_matrix["TP"] + confusion_matrix["FP"] + confusion_matrix["TN"] + confusion_matrix["FN"]) == 0:
-        # If no samples of this class were present, we can't calculate any metrics
         return log_dict
     log_dict[f"{log_prefix}/acc"] = (confusion_matrix["TP"] + confusion_matrix["TN"]) / (confusion_matrix["TP"] + confusion_matrix["FP"] + confusion_matrix["TN"] + confusion_matrix["FN"])
     log_dict[f"{log_prefix}/Prevalence"] = (confusion_matrix["TP"]) / (confusion_matrix["TP"] + confusion_matrix["FP"] + confusion_matrix["TN"] + confusion_matrix["FN"])

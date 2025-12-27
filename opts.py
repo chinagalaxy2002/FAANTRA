@@ -33,7 +33,7 @@ def update_args(args, config):
     args.n_layers = config['n_layers']  # Number of layers to use in temporal architecture. Does not apply to the transformer
     args.sgp_ks = config['sgp_ks']  # Kernel size of the SGP and SGP-Mixer layers
     args.sgp_r = config['sgp_r']    # r factor in SGP and SGP-Mixer layers
-
+    args.ddim_timesteps = config.get("ddim_timesteps", 10) # 默认为 10，如果在 json 里写了 50 就会用 50
     args.num_workers = config['num_workers']    # Number of workers to use for data loading
     # Load the dual training arguments
     if 'jointtrain' in config and config['use_jointtrain'] :

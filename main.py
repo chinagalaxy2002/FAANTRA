@@ -5,8 +5,7 @@ import os
 import wandb
 import sys
 from opts import get_args, update_args
-from torch.optim.lr_scheduler import (
-    ChainedScheduler, LinearLR, CosineAnnealingLR)
+from torch.optim.lr_scheduler import (ChainedScheduler, LinearLR, CosineAnnealingLR)
 from model.futr import FUTR
 from train import train
 from train_dual import train_dual
