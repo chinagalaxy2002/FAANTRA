@@ -217,8 +217,12 @@ class FUTR(nn.Module):
             
             # 解析 model_out
             if model_out.dim() == 4: model_out = model_out[0]
-            # model_out shape [B, n_query, C] (因为 slice 过了)
+            # 此时 model_out shape 是 [B, C, T]，例如 [B, 15, 8]
             
+            # [重要修复] 将 [B, C, T] 重排为 [B, T, C]，例如 [B, 8, 15]
+            # 这样后面的索引 [:, :, self.n_class] 才能取到正确的通道，而不是越界的时间索引
+            model_out = rearrange(model_out, 'b c t -> b t c')
+
             # [保留修改] 反向映射 [-1, 1] -> [0, 1]
             pred_action_raw = model_out[:, :, :self.n_class]
             pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0 
@@ -249,6 +253,9 @@ class FUTR(nn.Module):
             
             sampled_x = sampled_x[0] 
             
+            # [重要修复] 同样，推理输出也是 [B, C, T]，需要重排为 [B, T, C]
+            sampled_x = rearrange(sampled_x, 'b c t -> b t c')
+
             # [保留修改] 反向映射
             pred_action_raw = sampled_x[:, :, :self.n_class]
             pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0
