@@ -23,12 +23,9 @@ except ImportError:
         from models_bit_diff import BitDiffPredictorTCN
         from model.T_Deed_Modules.shift import make_temporal_shift
     except ImportError as e:
-        print("Error: 无法导入依赖模块。")
+        print("Error: 无法导入 bit_diffusion, models_bit_diff 或 shift 模块。")
         raise e
 
-# ==========================================
-# 配置类
-# ==========================================
 class DiffusionConfig:
     def __init__(self, args, input_dim, num_classes):
         self.layer_type = "mamba"
@@ -42,9 +39,6 @@ class DiffusionConfig:
         self.use_features = True
         self.use_inp_ch_dropout = False
 
-# ==========================================
-# FUTR 主类 (优化版)
-# ==========================================
 class FUTR(nn.Module):
     def __init__(self, n_class, hidden_dim, src_pad_idx, device, args, n_query=8, n_head=8,
                  num_encoder_layers=6, num_decoder_layers=6, src_attn_mask=None, tgt_attn_mask=None):
@@ -57,7 +51,7 @@ class FUTR(nn.Module):
         self.args = args
         self.src_pad_idx = src_pad_idx
         
-        # 1. Backbone (保持不变)
+        # 1. Backbone
         self.feature_arch = args.feature_arch
         if self.feature_arch.startswith(('rny002', 'rny004', 'rny006', 'rny008')):
             self.features = timm.create_model({
@@ -96,18 +90,18 @@ class FUTR(nn.Module):
         else:
             self.actionness_dim = 0
 
+        # 注意：这里传给 Config 的 input_dim 是 hidden_dim (RegNet 投影后的维度)
         diff_cfg = DiffusionConfig(args, hidden_dim, self.diff_out_dim)
         self.denoise_model = BitDiffPredictorTCN(diff_cfg)
 
-        # [重要优化 1] 增加 timesteps 到 1000 (标准设置)
-        # [重要优化 2] 增加推理步数 ddim_timesteps 到 50 (如果 args 没设置)
-        sampling_steps = getattr(args, 'ddim_timesteps', 50) # 建议默认设为 50
+        sampling_steps = getattr(args, 'ddim_timesteps', 50) 
         
+        # [保留修改] Timesteps = 1000
         self.diffusion = GaussianBitDiffusion(
             model=self.denoise_model,
             condition_x0=False,
             num_classes=self.diff_out_dim,
-            timesteps=1000,          # <--- 修改这里：从 100 改为 1000
+            timesteps=1000,          
             ddim_timesteps=sampling_steps, 
             loss_type="l2",
             objective="pred_x0",
@@ -169,15 +163,16 @@ class FUTR(nn.Module):
         if self.args.seg:
             output['seg'] = self.fc_seg(obs_feat)
 
-        # 准备条件
-        obs_feat_trans = rearrange(obs_feat, 'b s d -> b d s')
-        obs_cond = F.interpolate(obs_feat_trans, size=self.n_query, mode='linear', align_corners=False)
-        obs_cond = rearrange(obs_cond, 'b d t -> b t d')
+        # ============================================================
+        # [核心修改] 移除 Interpolate，直接使用 obs_feat 作为 Condition
+        # obs_feat 维度: [Batch, T_past, HiddenDim]
+        # ============================================================
+        obs_cond = obs_feat 
         
+        # Mask 准备 (仅针对 Future 部分)
         mask_past = torch.ones((B, self.n_query, 1), device=self.device)
         masks_stages = [torch.ones((B, self.n_query, 1), device=self.device)]
         
-        # Offset 归一化因子
         norm_factor = float(self.args.clip_len)
 
         if mode == 'train':
@@ -195,49 +190,43 @@ class FUTR(nn.Module):
             gt_action_safe = gt_action.clone()
             gt_action_safe[~is_valid] = 0 
             
-            # [重要优化 3] 将数据映射到 [-1, 1] 区间
-            # 原因: Diffusion 模型在 [-1, 1] 区间工作最稳定，零均值分布
-            
-            # 1. Action: One-hot [0, 1] -> [-1, 1]
+            # [保留修改] 数据中心化映射 [-1, 1]
             x_0_cls = F.one_hot(gt_action_safe, num_classes=self.n_class).float()
             x_0_cls = x_0_cls * 2.0 - 1.0 
             
-            # 2. Offset: [0, ClipLen] -> [0, 1] -> [-1, 1]
             gt_offset_norm = gt_offset / norm_factor
             x_0_off = (gt_offset_norm.unsqueeze(-1) * 2.0) - 1.0
             
             x_0_parts = [x_0_cls, x_0_off]
             
-            # 3. Actionness: [0, 1] -> [-1, 1]
             if self.args.actionness and 'actionness' in targets_dict:
                 gt_act = targets_dict['actionness'].unsqueeze(-1)
-                gt_act = gt_act * 2.0 - 1.0
+                gt_act = gt_act * 2.0 - 1.0 
                 x_0_parts.append(gt_act)
             
             x_0 = torch.cat(x_0_parts, dim=-1)
 
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device).long()
 
+            # 传入原始长度的 obs_cond
             loss, model_out = self.diffusion.p_losses(
                 t=t, x_0=x_0, obs=obs_cond, mask_past=mask_past, mask_all=masks_stages
             )
             
             output['loss'] = loss
             
-            # --- 解析 model_out 供 train.py 日志使用 ---
+            # 解析 model_out
             if model_out.dim() == 4: model_out = model_out[0]
-            if model_out.shape[-1] == self.n_query: model_out = rearrange(model_out, 'b c t -> b t c')
+            # model_out shape [B, n_query, C] (因为 slice 过了)
             
-            # [重要] 反向映射: [-1, 1] -> [0, 1] -> Logits
-            # 1. Action
+            # [保留修改] 反向映射 [-1, 1] -> [0, 1]
             pred_action_raw = model_out[:, :, :self.n_class]
-            pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0 # Map back to [0, 1]
+            pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0 
             pred_action_logits = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
             
-            # 2. Offset
             pred_offset_raw = model_out[:, :, self.n_class]
-            pred_offset_01 = (pred_offset_raw + 1) / 2.0 # Map back to [0, 1]
-            pred_offset = pred_offset_01 * norm_factor # 反归一化
+            pred_offset_01 = (pred_offset_raw + 1) / 2.0
+            pred_offset = pred_offset_01 * norm_factor 
             
             output['action'] = pred_action_logits
             output['offset'] = pred_offset
@@ -249,7 +238,6 @@ class FUTR(nn.Module):
             
         else:
             # --- 推理模式 ---
-            # 采样
             sampled_x = self.diffusion.predict(
                 x_0=torch.zeros((B, self.n_query, self.diff_out_dim), device=self.device),
                 obs=obs_cond,
@@ -260,16 +248,12 @@ class FUTR(nn.Module):
             )
             
             sampled_x = sampled_x[0] 
-            sampled_x = rearrange(sampled_x, 'b c t -> b t c')
-
-            # [重要] 反向映射: [-1, 1] -> [0, 1] -> Logits
-            # 1. Action
+            
+            # [保留修改] 反向映射
             pred_action_raw = sampled_x[:, :, :self.n_class]
-            # 这里一定要 clamp，因为 Diffusion 预测值可能会轻微超出 [-1, 1]
             pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0
             pred_action_logits = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
             
-            # 2. Offset
             pred_offset_raw = sampled_x[:, :, self.n_class]
             pred_offset_01 = (pred_offset_raw + 1) / 2.0
             pred_offset = pred_offset_01 * norm_factor

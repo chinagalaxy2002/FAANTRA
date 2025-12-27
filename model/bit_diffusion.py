@@ -228,7 +228,9 @@ class GaussianBitDiffusion(nn.Module):
 
 
         # OBSERVATION CONDITIONING
-        obs_cond = obs * mask_past  # not really necessary but just in case 
+        # [修改] 移除 mask_past 的乘法，防止维度不匹配。
+        # 在时间拼接架构下，obs 是 Past Feature，长度与 mask_past (Future Mask) 不同。
+        obs_cond = obs  
 
         # SELF-CONDITIONING
         self_cond = torch.zeros_like(x_0).to(x_0.device)
@@ -284,6 +286,9 @@ class GaussianBitDiffusion(nn.Module):
 
         mask_past = batch['mask_past']
         mask_past = mask_past.to(torch.bool)
+        
+        # 注意: 如果这个 forward 方法被调用，这里的 repeat 可能会有问题，
+        # 但在 futr.py 中是直接调用 p_losses，所以主要修正 p_losses 即可。
         mask_past = repeat(mask_past, 'b t 1 -> b t c', c=obs.shape[-1])
 
         # get random diff timestep
@@ -343,12 +348,14 @@ class GaussianBitDiffusion(nn.Module):
         if_prev=False
     ):
         
+        # [修改] 移除 batch['mask_past'] 的乘法
+        obs_input = batch['obs'] 
 
         # MODEL PRED
         preds = self.model_predictions(x=x,
                                        pred_x_start_prev=pred_x_start_prev,
                                        t=t,
-                                       obs=batch['obs'] * batch['mask_past'],
+                                       obs=obs_input,
                                        stage_masks=batch['mask_all'])
         pred_x_start = preds.pred_x_start
         pred_noise = preds.pred_noise
@@ -446,8 +453,11 @@ class GaussianBitDiffusion(nn.Module):
     ):
         
         # Initialize observation
+        # [注意] 这里 obs 会被重复，以匹配 parallel sampling
         obs = repeat(obs, "b t c -> (s b) t c", s=n_samples)
         x_0 = repeat(x_0, "b t c -> (s b) t c ", s=n_samples)
+        
+        # mask_past 在 futr.py 中其实是 future target 的 mask
         mask_past = repeat(mask_past, "b t 1 -> (s b) t c", s=n_samples, c=obs.shape[-1])
         masks_stages = [repeat(mask.to(torch.bool), "b t c -> (s b) t c", s=n_samples) for mask in masks_stages]
 
@@ -465,6 +475,3 @@ class GaussianBitDiffusion(nn.Module):
           
         # Return
         return rearrange(x_out, "(s b) t c -> s b c t", s=n_samples)
-
-
-
