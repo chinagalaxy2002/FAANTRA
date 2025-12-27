@@ -5,33 +5,60 @@ import numpy as np
 import math
 import os
 import sys
-import pdb
+import timm
 import torchvision.transforms as T
 from einops import repeat, rearrange
-from model.extras.transformer import Transformer
-from model.extras.position import PositionalEncoding
-import timm
-from model.T_Deed_Modules.modules import EDSGPMIXERLayers
-from model.T_Deed_Modules.shift import make_temporal_shift
 
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+# ==========================================
+# 导入模块
+# ==========================================
+try:
+    from bit_diffusion import GaussianBitDiffusion
+    from models_bit_diff import BitDiffPredictorTCN
+    from model.T_Deed_Modules.shift import make_temporal_shift
+except ImportError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from bit_diffusion import GaussianBitDiffusion
+        from models_bit_diff import BitDiffPredictorTCN
+        from model.T_Deed_Modules.shift import make_temporal_shift
+    except ImportError as e:
+        print("Error: 无法导入依赖模块。")
+        raise e
 
+# ==========================================
+# 配置类
+# ==========================================
+class DiffusionConfig:
+    def __init__(self, args, input_dim, num_classes):
+        self.layer_type = "mamba"
+        self.kernel_size = 3
+        self.num_stages = 1
+        self.num_layers = args.num_encoder_layers if hasattr(args, 'num_encoder_layers') else 4
+        self.model_dim = args.hidden_dim
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+        self.channel_dropout_prob = 0.1
+        self.use_features = True
+        self.use_inp_ch_dropout = False
+
+# ==========================================
+# FUTR 主类 (优化版)
+# ==========================================
 class FUTR(nn.Module):
-
     def __init__(self, n_class, hidden_dim, src_pad_idx, device, args, n_query=8, n_head=8,
                  num_encoder_layers=6, num_decoder_layers=6, src_attn_mask=None, tgt_attn_mask=None):
         super().__init__()
-        if num_decoder_layers < 1 and n_query > 1:
-            raise ValueError(f"n_query must be 1 if no decoder is to be used\nGiven values are: {n_query} and {num_decoder_layers} respectively")
-        self.encoder_only = num_decoder_layers == 0
-        self.src_pad_idx = src_pad_idx
+        
         self.device = device
+        self.n_query = n_query
+        self.n_class = n_class
         self.hidden_dim = hidden_dim
+        self.args = args
+        self.src_pad_idx = src_pad_idx
+        
+        # 1. Backbone (保持不变)
         self.feature_arch = args.feature_arch
-        self.temp_arch = args.temporal_arch
-        self.src_attn_mask = src_attn_mask
-        self.tgt_attn_mask = tgt_attn_mask
-        self.jointtrain_available = args.jointtrain is not None
         if self.feature_arch.startswith(('rny002', 'rny004', 'rny006', 'rny008')):
             self.features = timm.create_model({
                 'rny002': 'regnety_002',
@@ -40,184 +67,222 @@ class FUTR(nn.Module):
                 'rny008': 'regnety_008',
             }[self.feature_arch.rsplit('_', 1)[0]], pretrained=True)
             feat_dim = self.features.head.fc.in_features
-
-            # Remove final classification layer
             self.features.head.fc = nn.Identity()
             self.input_dim = feat_dim
         else:
-            raise NotImplementedError(args.feature_arch)
-        
-        # Add Temporal Shift Modules
-        # NOTE: NEED TO CHANGE 2ND ARGUMENT FOR CHEATING DATASET
+            raise NotImplementedError(f"Architecture {args.feature_arch} not supported")
+            
         max_obs_len = int(args.clip_len*args.cheating_range[1])-int(args.clip_len*args.cheating_range[0]) if args.cheating_dataset else int(args.clip_len*max(args.obs_perc))
         if self.feature_arch.endswith('_gsm'):
             make_temporal_shift(self.features, max_obs_len, mode='gsm')
         elif self.feature_arch.endswith('_gsf'):
             make_temporal_shift(self.features, max_obs_len, mode='gsf')
 
-        if self.temp_arch == 'ed_sgp_mixer':
-            #Positional encoding
-            self.temp_enc = nn.Parameter(torch.normal(mean = 0, std = 1 / max_obs_len, size = (max_obs_len, self.input_dim)))
-            self.temp_fine = EDSGPMIXERLayers(self.input_dim, max_obs_len, num_layers=args.n_layers, ks = args.sgp_ks, k = args.sgp_r, concat = True)
+        # 2. Projection
+        self.input_proj = nn.Linear(self.input_dim, hidden_dim)
+        self.relu = nn.ReLU()
 
-        self.input_embed = nn.Linear(self.input_dim, hidden_dim)
-        self.transformer = Transformer(hidden_dim, n_head, num_encoder_layers, num_decoder_layers,
-                                        hidden_dim*4, normalize_before=False)
-        self.n_query = n_query
-        self.args = args
-        nn.init.xavier_uniform_(self.input_embed.weight)
-        self.query_embed = nn.Embedding(self.n_query, hidden_dim)
-
-
-        if args.seg :
+        if args.seg:
             self.fc_seg = nn.Linear(hidden_dim, n_class)
-            nn.init.xavier_uniform_(self.fc_seg.weight)
-            if self.jointtrain_available:
-                self.fc_seg_jointtrain = nn.Linear(hidden_dim, args.jointtrain['num_classes'] + 1)  # +1 for background class
-                nn.init.xavier_uniform_(self.fc_seg_jointtrain.weight)
 
-        if args.anticipate :
-            # Anticipation head has the capacity to predict background class despite it not being anywhere in anticipation
-            # To avoid this I will make the EOS token the same number as the background class
-            self.fc = nn.Linear(hidden_dim, n_class - 1*args.actionness)
-            nn.init.xavier_uniform_(self.fc.weight)
-            self.fc_len = nn.Linear(hidden_dim, 1)
-            nn.init.xavier_uniform_(self.fc_len.weight)
-            if self.jointtrain_available:
-                self.fc_jointtrain = nn.Linear(hidden_dim, args.jointtrain['num_classes'] + 1 - 1*args.actionness)
-                nn.init.xavier_uniform_(self.fc_jointtrain.weight)
-                self.fc_len_jointtrain = nn.Linear(hidden_dim, 1)
-                nn.init.xavier_uniform_(self.fc_len_jointtrain.weight)
+        # 3. Diffusion Mamba Setup
+        self.diff_out_dim = n_class 
+        self.offset_dim = 1
+        self.diff_out_dim += self.offset_dim
         
-        if args.actionness :
-            self.fc_actionness = nn.Linear(hidden_dim, 1)
-            nn.init.xavier_uniform_(self.fc_actionness.weight)
-            if self.jointtrain_available:
-                self.fc_actionness_jointtrain = nn.Linear(hidden_dim, 1)
-                nn.init.xavier_uniform_(self.fc_actionness_jointtrain.weight)
+        if args.actionness:
+            self.actionness_dim = 1
+            self.diff_out_dim += self.actionness_dim
+        else:
+            self.actionness_dim = 0
 
-        if args.pos_emb:
-            #pos embedding
-            max_seq_len = args.max_pos_len
-            self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
-            nn.init.xavier_uniform_(self.pos_embedding)
-            # Sinusoidal position encoding
-            self.pos_enc = PositionalEncoding(hidden_dim)
+        diff_cfg = DiffusionConfig(args, hidden_dim, self.diff_out_dim)
+        self.denoise_model = BitDiffPredictorTCN(diff_cfg)
 
-        # Preprocessing
-        # Augmentations
+        # [重要优化 1] 增加 timesteps 到 1000 (标准设置)
+        # [重要优化 2] 增加推理步数 ddim_timesteps 到 50 (如果 args 没设置)
+        sampling_steps = getattr(args, 'ddim_timesteps', 50) # 建议默认设为 50
+        
+        self.diffusion = GaussianBitDiffusion(
+            model=self.denoise_model,
+            condition_x0=False,
+            num_classes=self.diff_out_dim,
+            timesteps=1000,          # <--- 修改这里：从 100 改为 1000
+            ddim_timesteps=sampling_steps, 
+            loss_type="l2",
+            objective="pred_x0",
+            beta_schedule="cosine"
+        )
+
+        # 4. Augmentation
         self.augmentation = T.Compose([
-            T.RandomApply([T.ColorJitter(hue = 0.2)], p = 0.25),
-            T.RandomApply([T.ColorJitter(saturation = (0.7, 1.2))], p = 0.25),
-            T.RandomApply([T.ColorJitter(brightness = (0.7, 1.2))], p = 0.25),
-            T.RandomApply([T.ColorJitter(contrast = (0.7, 1.2))], p = 0.25),
-            T.RandomApply([T.GaussianBlur(5)], p = 0.25),
+            T.RandomApply([T.ColorJitter(hue=0.2)], p=0.25),
+            T.RandomApply([T.ColorJitter(saturation=(0.7, 1.2))], p=0.25),
+            T.RandomApply([T.ColorJitter(brightness=(0.7, 1.2))], p=0.25),
+            T.RandomApply([T.ColorJitter(contrast=(0.7, 1.2))], p=0.25),
+            T.RandomApply([T.GaussianBlur(5)], p=0.25),
             T.RandomHorizontalFlip(),
         ])
-        #Standarization
-        self.standarization = T.Compose([
-            T.Normalize(mean = (0.485, 0.456, 0.406), std = (0.229, 0.224, 0.225)) #Imagenet mean and std
-        ])
         
+        self.standarization = T.Compose([
+            T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        ])
+
     def augment(self, x):
-            for i in range(x.shape[0]):
-                x[i] = self.augmentation(x[i])
-            return x
+        for i in range(x.shape[0]):
+            x[i] = self.augmentation(x[i])
+        return x
 
     def standarize(self, x):
         for i in range(x.shape[0]):
             x[i] = self.standarization(x[i])
         return x
 
-    # TODO: Implement proper frame pre-processing
     def forward(self, inputs, mode='train'):
-        if mode == 'train' :
-            src, src_label = inputs
-            tgt_key_padding_mask = None
-            src_key_padding_mask = get_pad_mask(src_label, self.src_pad_idx).to(self.device)
-            memory_key_padding_mask = src_key_padding_mask.clone().to(self.device)
-        else :
+        targets_dict = None
+        
+        if mode == 'train':
+            if isinstance(inputs, tuple) or isinstance(inputs, list):
+                src = inputs[0]
+                if len(inputs) > 1 and isinstance(inputs[1], dict):
+                    targets_dict = inputs[1]
+                elif len(inputs) > 1:
+                    src_label = inputs[1] 
+            else:
+                src = inputs
+        else:
             src = inputs
-            src_key_padding_mask = None
-            memory_key_padding_mask = None
-            tgt_key_padding_mask = None
-
-        src_mask = self.src_attn_mask
-        tgt_mask = self.tgt_attn_mask
 
         B, S, C, H, W = src.size()
-        src = src/255.0         # Normalize
+        src = src / 255.0
+        
         if mode == "train":
-            src = self.augment(src) #augmentation per-batch
-        src = self.standarize(src) #standarization imagenet stats
-        src = self.features(src.view(-1, C, H, W)).reshape(B, S, self.input_dim)
-
-        if self.temp_arch == 'ed_sgp_mixer':
-            src = src + self.temp_enc.expand(B, -1, -1)
-            src = self.temp_fine(src)
-        src = self.input_embed(src) #[B, S, C]
-        src = F.relu(src)
-
-        # action query embedding
-        action_query = self.query_embed.weight
-        action_query = action_query.unsqueeze(0).repeat(B, 1, 1)
-        tgt = torch.zeros_like(action_query)
-
-        # pos embedding
-        if self.encoder_only:
-            pos = self.pos_embedding[:, :S+1,].repeat(B, 1, 1)
-            if src_key_padding_mask is not None:
-                false_append = torch.tensor([False], device=src_key_padding_mask.device).expand((src_key_padding_mask.shape[0], 1))
-                src_key_padding_mask = torch.cat((src_key_padding_mask, false_append),dim=1)
-        else:
-            pos = self.pos_embedding[:, :S,].repeat(B, 1, 1)
-        src = rearrange(src, 'b t c -> t b c')
-        tgt = rearrange(tgt, 'b t c -> t b c')
-        pos = rearrange(pos, 'b t c -> t b c')
-        action_query = rearrange(action_query, 'b t c -> t b c')
-        src, tgt = self.transformer(src, tgt, src_key_padding_mask, src_mask, tgt_mask, None, action_query, pos, None)
-
-        tgt = rearrange(tgt, 't b c -> b t c')
-        src = rearrange(src, 't b c -> b t c')
+            src = self.augment(src)
+        
+        src = self.standarize(src)
+        
+        # 特征提取
+        features = self.features(src.view(-1, C, H, W)).reshape(B, S, self.input_dim)
+        obs_feat = self.relu(self.input_proj(features))
 
         output = dict()
-        if self.args.anticipate :
-            # action anticipation
-            output_class = self.fc(tgt) #[T, B, C]  Note: I actually think this is [B, T, C]
-            offset = self.fc_len(tgt) #[B, T, 1]
-            offset = offset.squeeze(2) #[B, T]
-            if self.jointtrain_available:
-                output_class_jointtrain = self.fc_jointtrain(tgt)
-                offset_jointtrain = self.fc_len_jointtrain(tgt)
-                offset_jointtrain = offset_jointtrain.squeeze(2)
-                output_class = torch.cat([output_class, output_class_jointtrain], dim = 2)
-                offset = torch.cat([offset, offset_jointtrain], dim = 1)
-            output['offset'] = offset
-            output['action'] = output_class
+        if self.args.seg:
+            output['seg'] = self.fc_seg(obs_feat)
 
-        if self.args.seg :
-            # action segmentation
-            tgt_seg = self.fc_seg(src)
-            if self.jointtrain_available:
-                tgt_seg_jointtrain = self.fc_seg_jointtrain(src)
-                tgt_seg = torch.cat([tgt_seg, tgt_seg_jointtrain], dim = 2)
-            output['seg'] = tgt_seg
+        # 准备条件
+        obs_feat_trans = rearrange(obs_feat, 'b s d -> b d s')
+        obs_cond = F.interpolate(obs_feat_trans, size=self.n_query, mode='linear', align_corners=False)
+        obs_cond = rearrange(obs_cond, 'b d t -> b t d')
         
-        if self.args.actionness :
-            # actionness
-            actionness = self.fc_actionness(tgt)    #[B, T, 1]
-            actionness = actionness.squeeze(2)      #[B, T]
-            if self.jointtrain_available:
-                actionness_jointtrain = self.fc_actionness_jointtrain(tgt)
-                actionness_jointtrain = actionness_jointtrain.squeeze(2)      #[B, T]
-                actionness = torch.cat([actionness, actionness_jointtrain], dim = 1)
-            output['actionness'] = actionness
+        mask_past = torch.ones((B, self.n_query, 1), device=self.device)
+        masks_stages = [torch.ones((B, self.n_query, 1), device=self.device)]
+        
+        # Offset 归一化因子
+        norm_factor = float(self.args.clip_len)
+
+        if mode == 'train':
+            if targets_dict is None or 'action' not in targets_dict:
+                raise ValueError("Diffusion Training requires targets_dict.")
+
+            gt_action = targets_dict['action'].long()
+            gt_offset = targets_dict['offset']
+            
+            # Mask Logic
+            is_valid = (gt_action != self.src_pad_idx)
+            mask_past = is_valid.unsqueeze(-1).float()
+            masks_stages = [mask_past] 
+            
+            gt_action_safe = gt_action.clone()
+            gt_action_safe[~is_valid] = 0 
+            
+            # [重要优化 3] 将数据映射到 [-1, 1] 区间
+            # 原因: Diffusion 模型在 [-1, 1] 区间工作最稳定，零均值分布
+            
+            # 1. Action: One-hot [0, 1] -> [-1, 1]
+            x_0_cls = F.one_hot(gt_action_safe, num_classes=self.n_class).float()
+            x_0_cls = x_0_cls * 2.0 - 1.0 
+            
+            # 2. Offset: [0, ClipLen] -> [0, 1] -> [-1, 1]
+            gt_offset_norm = gt_offset / norm_factor
+            x_0_off = (gt_offset_norm.unsqueeze(-1) * 2.0) - 1.0
+            
+            x_0_parts = [x_0_cls, x_0_off]
+            
+            # 3. Actionness: [0, 1] -> [-1, 1]
+            if self.args.actionness and 'actionness' in targets_dict:
+                gt_act = targets_dict['actionness'].unsqueeze(-1)
+                gt_act = gt_act * 2.0 - 1.0
+                x_0_parts.append(gt_act)
+            
+            x_0 = torch.cat(x_0_parts, dim=-1)
+
+            t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device).long()
+
+            loss, model_out = self.diffusion.p_losses(
+                t=t, x_0=x_0, obs=obs_cond, mask_past=mask_past, mask_all=masks_stages
+            )
+            
+            output['loss'] = loss
+            
+            # --- 解析 model_out 供 train.py 日志使用 ---
+            if model_out.dim() == 4: model_out = model_out[0]
+            if model_out.shape[-1] == self.n_query: model_out = rearrange(model_out, 'b c t -> b t c')
+            
+            # [重要] 反向映射: [-1, 1] -> [0, 1] -> Logits
+            # 1. Action
+            pred_action_raw = model_out[:, :, :self.n_class]
+            pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0 # Map back to [0, 1]
+            pred_action_logits = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
+            
+            # 2. Offset
+            pred_offset_raw = model_out[:, :, self.n_class]
+            pred_offset_01 = (pred_offset_raw + 1) / 2.0 # Map back to [0, 1]
+            pred_offset = pred_offset_01 * norm_factor # 反归一化
+            
+            output['action'] = pred_action_logits
+            output['offset'] = pred_offset
+            
+            if self.args.actionness:
+                 pred_act_raw = model_out[:, :, self.n_class + 1]
+                 pred_act_probs = (pred_act_raw.clamp(-1, 1) + 1) / 2.0
+                 output['actionness'] = torch.logit(pred_act_probs.clamp(min=1e-6, max=1-1e-6))
+            
+        else:
+            # --- 推理模式 ---
+            # 采样
+            sampled_x = self.diffusion.predict(
+                x_0=torch.zeros((B, self.n_query, self.diff_out_dim), device=self.device),
+                obs=obs_cond,
+                mask_past=mask_past,
+                masks_stages=masks_stages,
+                n_samples=1,
+                n_diffusion_steps=self.diffusion.ddim_timesteps
+            )
+            
+            sampled_x = sampled_x[0] 
+            sampled_x = rearrange(sampled_x, 'b c t -> b t c')
+
+            # [重要] 反向映射: [-1, 1] -> [0, 1] -> Logits
+            # 1. Action
+            pred_action_raw = sampled_x[:, :, :self.n_class]
+            # 这里一定要 clamp，因为 Diffusion 预测值可能会轻微超出 [-1, 1]
+            pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0
+            pred_action_logits = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
+            
+            # 2. Offset
+            pred_offset_raw = sampled_x[:, :, self.n_class]
+            pred_offset_01 = (pred_offset_raw + 1) / 2.0
+            pred_offset = pred_offset_01 * norm_factor
+            
+            output['action'] = pred_action_logits
+            output['offset'] = pred_offset
+            
+            if self.args.actionness:
+                pred_act_raw = sampled_x[:, :, self.n_class + 1]
+                pred_act_probs = (pred_act_raw.clamp(-1, 1) + 1) / 2.0
+                output['actionness'] = torch.logit(pred_act_probs.clamp(min=1e-6, max=1-1e-6))
 
         return output
 
-
 def get_pad_mask(seq, pad_idx):
-    return (seq ==pad_idx)
-
-
-
+    return (seq == pad_idx)
