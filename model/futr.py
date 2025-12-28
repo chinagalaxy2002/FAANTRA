@@ -1,3 +1,4 @@
+# model/futr.py
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -155,8 +156,10 @@ class FUTR(nn.Module):
         
         src = self.standarize(src)
         
-        # 特征提取
+        # --- 特征提取 ---
+        # features: [B, S, InputDim]
         features = self.features(src.view(-1, C, H, W)).reshape(B, S, self.input_dim)
+        # obs_feat: [B, S, HiddenDim]
         obs_feat = self.relu(self.input_proj(features))
 
         output = dict()
@@ -164,13 +167,17 @@ class FUTR(nn.Module):
             output['seg'] = self.fc_seg(obs_feat)
 
         # ============================================================
-        # [核心修改] 移除 Interpolate，直接使用 obs_feat 作为 Condition
-        # obs_feat 维度: [Batch, T_past, HiddenDim]
+        # [修改 1] Time-Concat 准备
+        # 直接使用原始观察序列作为 Condition，不进行插值压缩
         # ============================================================
         obs_cond = obs_feat 
         
-        # Mask 准备 (仅针对 Future 部分)
-        mask_past = torch.ones((B, self.n_query, 1), device=self.device)
+        # [修改 2] 构造 Mask
+        # mask_past: 对应 obs_cond 的长度 S (Past)
+        mask_past = torch.ones((B, S, 1), device=self.device)
+        
+        # mask_future: 对应 x_t 的长度 n_query (Future)
+        # 默认全为 1，训练时会根据 padding 更新
         masks_stages = [torch.ones((B, self.n_query, 1), device=self.device)]
         
         norm_factor = float(self.args.clip_len)
@@ -182,18 +189,21 @@ class FUTR(nn.Module):
             gt_action = targets_dict['action'].long()
             gt_offset = targets_dict['offset']
             
-            # Mask Logic
+            # --- 构造 Future Mask ---
+            # 只对非 Pad 的部分计算 Loss
             is_valid = (gt_action != self.src_pad_idx)
-            mask_past = is_valid.unsqueeze(-1).float()
-            masks_stages = [mask_past] 
+            mask_future = is_valid.unsqueeze(-1).float() # [B, n_query, 1]
+            masks_stages = [mask_future] 
             
+            # --- 构造 Training Targets (x_0) ---
             gt_action_safe = gt_action.clone()
             gt_action_safe[~is_valid] = 0 
             
-            # [保留修改] 数据中心化映射 [-1, 1]
+            # 类别: One-hot 并映射到 [-1, 1]
             x_0_cls = F.one_hot(gt_action_safe, num_classes=self.n_class).float()
             x_0_cls = x_0_cls * 2.0 - 1.0 
             
+            # 偏移量: 归一化并映射到 [-1, 1]
             gt_offset_norm = gt_offset / norm_factor
             x_0_off = (gt_offset_norm.unsqueeze(-1) * 2.0) - 1.0
             
@@ -206,24 +216,27 @@ class FUTR(nn.Module):
             
             x_0 = torch.cat(x_0_parts, dim=-1)
 
+            # 随机采样时间步 t
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device).long()
 
-            # 传入原始长度的 obs_cond
+            # --- 调用 Diffusion (Training) ---
+            # 传入 obs (Past) 和 mask_past
             loss, model_out = self.diffusion.p_losses(
-                t=t, x_0=x_0, obs=obs_cond, mask_past=mask_past, mask_all=masks_stages
+                t=t, 
+                x_0=x_0, 
+                obs=obs_cond, 
+                mask_past=mask_past, 
+                mask_all=masks_stages
             )
             
             output['loss'] = loss
             
-            # 解析 model_out
+            # 解析输出用于监控 (可选)
+            if isinstance(model_out, list): model_out = model_out[-1]
             if model_out.dim() == 4: model_out = model_out[0]
-            # 此时 model_out shape 是 [B, C, T]，例如 [B, 15, 8]
-            
-            # [重要修复] 将 [B, C, T] 重排为 [B, T, C]，例如 [B, 8, 15]
-            # 这样后面的索引 [:, :, self.n_class] 才能取到正确的通道，而不是越界的时间索引
             model_out = rearrange(model_out, 'b c t -> b t c')
 
-            # [保留修改] 反向映射 [-1, 1] -> [0, 1]
+            # 反向映射 [-1, 1] -> Logits/Values
             pred_action_raw = model_out[:, :, :self.n_class]
             pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0 
             pred_action_logits = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
@@ -241,22 +254,22 @@ class FUTR(nn.Module):
                  output['actionness'] = torch.logit(pred_act_probs.clamp(min=1e-6, max=1-1e-6))
             
         else:
-            # --- 推理模式 ---
+            # --- 调用 Diffusion (Inference) ---
+            # 修复了这里的缩进和调用逻辑
             sampled_x = self.diffusion.predict(
                 x_0=torch.zeros((B, self.n_query, self.diff_out_dim), device=self.device),
                 obs=obs_cond,
                 mask_past=mask_past,
                 masks_stages=masks_stages,
-                n_samples=1,
+                n_samples=10, 
                 n_diffusion_steps=self.diffusion.ddim_timesteps
             )
             
-            sampled_x = sampled_x[0] 
-            
-            # [重要修复] 同样，推理输出也是 [B, C, T]，需要重排为 [B, T, C]
-            sampled_x = rearrange(sampled_x, 'b c t -> b t c')
+            # BitDiffusion 返回 [Samples, B, C, T]，先取平均
+            sampled_x_avg = sampled_x.mean(dim=0) 
+            sampled_x = rearrange(sampled_x_avg, 'b c t -> b t c')
 
-            # [保留修改] 反向映射
+            # 反向映射
             pred_action_raw = sampled_x[:, :, :self.n_class]
             pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0
             pred_action_logits = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
@@ -274,6 +287,3 @@ class FUTR(nn.Module):
                 output['actionness'] = torch.logit(pred_act_probs.clamp(min=1e-6, max=1-1e-6))
 
         return output
-
-def get_pad_mask(seq, pad_idx):
-    return (seq == pad_idx)

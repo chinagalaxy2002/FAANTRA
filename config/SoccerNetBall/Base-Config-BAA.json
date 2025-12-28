@@ -19,7 +19,7 @@
     "start_map_epoch": 10,
     "temporal_arch": "none",
     "n_layers": 2,
-    "ddim_timesteps": 100,
+    "ddim_timesteps": 50,
     "num_pred_frames": 64,
     "sgp_ks": 9,
     "sgp_r": 4,
