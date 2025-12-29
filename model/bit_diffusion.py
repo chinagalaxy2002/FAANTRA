@@ -1,5 +1,5 @@
 """
-https://github.com/lucidrains/denoising-diffusion-pytorch
+https://github.com/lucidrains/denoising-diffusion-pytorch  v3
 """
 import math
 from collections import namedtuple
@@ -12,21 +12,6 @@ from torch import nn
 from tqdm import tqdm
 
 ModelPrediction = namedtuple("ModelPrediction", ["pred_noise", "pred_x_start"])
-
-
-class DiffusionModel(nn.Module):
-    """
-    Template model for the diffusion process
-    """
-
-    def __init__(
-        self,
-    ):
-        super().__init__()
-
-
-    def forward(self, X_0, X_t, batch):
-        raise NotImplementedError("Nope")
 
 
 def exists(x):
@@ -77,6 +62,21 @@ def cosine_beta_schedule(timesteps, s=0.008):
     return torch.clip(betas, 0, 0.999)
 
 
+class DiffusionModel(nn.Module):
+    """
+    Template model for the diffusion process
+    """
+
+    def __init__(
+        self,
+    ):
+        super().__init__()
+
+
+    def forward(self, X_0, X_t, batch):
+        raise NotImplementedError("Nope")
+
+
 class GaussianBitDiffusion(nn.Module):
     def __init__(
         self,
@@ -93,7 +93,7 @@ class GaussianBitDiffusion(nn.Module):
     ):
         
         super().__init__()
-        print('Bit Diffusion')
+        print('Bit Diffusion (Modified for FAANTRA SeqConcat)')
         print(f'Num classes : {num_classes}')
         print(f'Loss type : {loss_type}')
         print(f'Objective: {objective}')
@@ -267,13 +267,19 @@ class GaussianBitDiffusion(nn.Module):
 
         if self.loss_type == 'l2':
             target = repeat(target, 'b t c -> s b t c', s=model_out.shape[0])
-            mask_all = torch.stack(mask_all, dim=0)
+            if isinstance(mask_all, list):
+                mask_all = torch.stack(mask_all, dim=0)
 
             loss = self.loss_fn(model_out, target, reduction="none")  # S x B x T x C
             loss = torch.sum(torch.mean(loss * mask_all, dim=(2, 3)))
 
         # OUT
-        return loss, rearrange(model_out, 's b t c -> s b c t')
+        # [修改] 返回字典以适配 train.py 多任务处理
+        return {
+            "loss": loss,
+            "action": model_out[-1], # 用于 Acc 计算
+            "x_t": x_t
+        }
 
 
 
@@ -282,14 +288,15 @@ class GaussianBitDiffusion(nn.Module):
         obs = batch['obs']  # padded observed features
         
         masks_stages = batch['masks_stages']
-        masks_stages = [mask.to(torch.bool) for mask in masks_stages]
+        # masks_stages = [mask.to(torch.bool) for mask in masks_stages]
+        masks_stages = [mask.to(x_0.device) for mask in masks_stages]
 
         mask_past = batch['mask_past']
         mask_past = mask_past.to(torch.bool)
         
-        # 注意: 如果这个 forward 方法被调用，这里的 repeat 可能会有问题，
-        # 但在 futr.py 中是直接调用 p_losses，所以主要修正 p_losses 即可。
-        mask_past = repeat(mask_past, 'b t 1 -> b t c', c=obs.shape[-1])
+        # 修正 mask 维度以匹配 x_0 (B, T_future, C)
+        if mask_past.shape[-1] != x_0.shape[-1]:
+             mask_past = repeat(mask_past, 'b t 1 -> b t c', c=x_0.shape[-1])
 
         # get random diff timestep
         t = torch.randint(0, self.num_timesteps, (obs.size(0),), device=obs.device).long()

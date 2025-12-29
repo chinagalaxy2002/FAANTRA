@@ -1,4 +1,4 @@
-# model/futr.py
+# model/futr.py(v3)
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -97,7 +97,6 @@ class FUTR(nn.Module):
 
         sampling_steps = getattr(args, 'ddim_timesteps', 50) 
         
-        # [保留修改] Timesteps = 1000
         self.diffusion = GaussianBitDiffusion(
             model=self.denoise_model,
             condition_x0=False,
@@ -136,17 +135,27 @@ class FUTR(nn.Module):
     def forward(self, inputs, mode='train'):
         targets_dict = None
         
-        if mode == 'train':
-            if isinstance(inputs, tuple) or isinstance(inputs, list):
-                src = inputs[0]
-                if len(inputs) > 1 and isinstance(inputs[1], dict):
-                    targets_dict = inputs[1]
-                elif len(inputs) > 1:
-                    src_label = inputs[1] 
+        # ==========================================
+        # [修改] 输入解析逻辑，适配 dict 输入
+        # ==========================================
+        if isinstance(inputs, dict):
+            src = inputs['obs'] # 获取原始图像 Tensor
+            targets_dict = inputs
+            if 'mode' in inputs:
+                mode = inputs['mode']
+        else:
+            # 兼容旧代码或非字典输入
+            if mode == 'train':
+                if isinstance(inputs, tuple) or isinstance(inputs, list):
+                    src = inputs[0]
+                    if len(inputs) > 1 and isinstance(inputs[1], dict):
+                        targets_dict = inputs[1]
+                    elif len(inputs) > 1:
+                        src_label = inputs[1] 
+                else:
+                    src = inputs
             else:
                 src = inputs
-        else:
-            src = inputs
 
         B, S, C, H, W = src.size()
         src = src / 255.0
@@ -166,76 +175,112 @@ class FUTR(nn.Module):
         if self.args.seg:
             output['seg'] = self.fc_seg(obs_feat)
 
-        # ============================================================
-        # [修改 1] Time-Concat 准备
-        # 直接使用原始观察序列作为 Condition，不进行插值压缩
-        # ============================================================
+        # Time-Concat 准备
         obs_cond = obs_feat 
         
-        # [修改 2] 构造 Mask
-        # mask_past: 对应 obs_cond 的长度 S (Past)
+        # 构造默认 Mask (仅作为 fallback 或 infer 使用)
         mask_past = torch.ones((B, S, 1), device=self.device)
-        
-        # mask_future: 对应 x_t 的长度 n_query (Future)
-        # 默认全为 1，训练时会根据 padding 更新
         masks_stages = [torch.ones((B, self.n_query, 1), device=self.device)]
         
         norm_factor = float(self.args.clip_len)
 
         if mode == 'train':
-            if targets_dict is None or 'action' not in targets_dict:
+            if targets_dict is None:
                 raise ValueError("Diffusion Training requires targets_dict.")
-
-            gt_action = targets_dict['action'].long()
-            gt_offset = targets_dict['offset']
             
-            # --- 构造 Future Mask ---
-            # 只对非 Pad 的部分计算 Loss
-            is_valid = (gt_action != self.src_pad_idx)
-            mask_future = is_valid.unsqueeze(-1).float() # [B, n_query, 1]
-            masks_stages = [mask_future] 
-            
-            # --- 构造 Training Targets (x_0) ---
-            gt_action_safe = gt_action.clone()
-            gt_action_safe[~is_valid] = 0 
-            
-            # 类别: One-hot 并映射到 [-1, 1]
-            x_0_cls = F.one_hot(gt_action_safe, num_classes=self.n_class).float()
-            x_0_cls = x_0_cls * 2.0 - 1.0 
-            
-            # 偏移量: 归一化并映射到 [-1, 1]
-            gt_offset_norm = gt_offset / norm_factor
-            x_0_off = (gt_offset_norm.unsqueeze(-1) * 2.0) - 1.0
-            
-            x_0_parts = [x_0_cls, x_0_off]
-            
-            if self.args.actionness and 'actionness' in targets_dict:
-                gt_act = targets_dict['actionness'].unsqueeze(-1)
-                gt_act = gt_act * 2.0 - 1.0 
-                x_0_parts.append(gt_act)
-            
-            x_0 = torch.cat(x_0_parts, dim=-1)
+            # [修改] 键名兼容处理 (将 train.py 的键映射到 futr.py 常用键)
+            if 'action_target' in targets_dict: targets_dict['action'] = targets_dict['action_target']
+            if 'offset_target' in targets_dict: targets_dict['offset'] = targets_dict['offset_target']
+            if 'actionness_target' in targets_dict: targets_dict['actionness'] = targets_dict['actionness_target']
 
             # 随机采样时间步 t
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device).long()
 
-            # --- 调用 Diffusion (Training) ---
-            # 传入 obs (Past) 和 mask_past
-            loss, model_out = self.diffusion.p_losses(
-                t=t, 
-                x_0=x_0, 
-                obs=obs_cond, 
-                mask_past=mask_past, 
-                mask_all=masks_stages
-            )
+            # [修改] 优先使用 train.py 中预计算好的 x_0 和 Masks
+            if 'x_0' in targets_dict and 'mask_past' in targets_dict:
+                x_0 = targets_dict['x_0']
+                # 注意：train.py 中的 mask_past 实际上是 future mask，这里直接透传
+                mask_past_for_diff = targets_dict['mask_past'] 
+                masks_stages_for_diff = targets_dict['masks_stages']
+                
+                # 如果预计算的 x_0 包含了 offset，则直接使用
+                # x_0 应该是 (B, T, C)
+                # 还需要拼接 Offset 吗？train.py 中的 x_0_onehot 只包含了类别
+                # 我们检查一下 x_0 的维度。如果维度 == n_class，说明还需要拼 Offset
+                
+                if x_0.shape[-1] == self.n_class:
+                    # 说明 train.py 只处理了类别 One-Hot，我们需要在这里补充 Offset 和 Mapping
+                    # 1. 映射类别到 [-1, 1]
+                    x_0_cls = x_0 * 2.0 - 1.0
+                    
+                    # 2. 处理 Offset
+                    gt_offset = targets_dict['offset']
+                    gt_offset_norm = gt_offset / norm_factor
+                    x_0_off = (gt_offset_norm.unsqueeze(-1) * 2.0) - 1.0
+                    
+                    x_0_parts = [x_0_cls, x_0_off]
+                    
+                    # 3. 处理 Actionness
+                    if self.args.actionness and 'actionness' in targets_dict:
+                        gt_act = targets_dict['actionness'].unsqueeze(-1)
+                        gt_act = gt_act * 2.0 - 1.0 
+                        x_0_parts.append(gt_act)
+                    
+                    x_0 = torch.cat(x_0_parts, dim=-1)
+                
+                # 调用 Diffusion
+                loss_dict = self.diffusion.p_losses(
+                    t=t, 
+                    x_0=x_0, 
+                    obs=obs_cond, 
+                    mask_past=mask_past_for_diff, 
+                    mask_all=masks_stages_for_diff
+                )
+                loss = loss_dict['loss']
+                model_out = loss_dict['action'] # (B, T, C)
             
+            else:
+                # [Legacy] 备用逻辑：如果 train.py 没有传 x_0
+                gt_action = targets_dict['action'].long()
+                gt_offset = targets_dict['offset']
+                
+                is_valid = (gt_action != self.src_pad_idx)
+                mask_future = is_valid.unsqueeze(-1).float()
+                masks_stages = [mask_future] 
+                
+                gt_action_safe = gt_action.clone()
+                gt_action_safe[~is_valid] = 0 
+                
+                x_0_cls = F.one_hot(gt_action_safe, num_classes=self.n_class).float()
+                x_0_cls = x_0_cls * 2.0 - 1.0 
+                
+                gt_offset_norm = gt_offset / norm_factor
+                x_0_off = (gt_offset_norm.unsqueeze(-1) * 2.0) - 1.0
+                
+                x_0_parts = [x_0_cls, x_0_off]
+                
+                if self.args.actionness and 'actionness' in targets_dict:
+                    gt_act = targets_dict['actionness'].unsqueeze(-1)
+                    gt_act = gt_act * 2.0 - 1.0 
+                    x_0_parts.append(gt_act)
+                
+                x_0 = torch.cat(x_0_parts, dim=-1)
+
+                loss_dict = self.diffusion.p_losses(
+                    t=t, 
+                    x_0=x_0, 
+                    obs=obs_cond, 
+                    mask_past=mask_past, # 这里可能需要 future mask，但 legacy 逻辑暂且保留
+                    mask_all=masks_stages
+                )
+                loss = loss_dict['loss']
+                model_out = loss_dict['action']
+
             output['loss'] = loss
             
-            # 解析输出用于监控 (可选)
-            if isinstance(model_out, list): model_out = model_out[-1]
-            if model_out.dim() == 4: model_out = model_out[0]
-            model_out = rearrange(model_out, 'b c t -> b t c')
-
+            # 解析输出用于监控
+            # bit_diffusion 返回的 action 已经是 (B, T, C)
+            
             # 反向映射 [-1, 1] -> Logits/Values
             pred_action_raw = model_out[:, :, :self.n_class]
             pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0 
@@ -255,12 +300,19 @@ class FUTR(nn.Module):
             
         else:
             # --- 调用 Diffusion (Inference) ---
-            # 修复了这里的缩进和调用逻辑
+            # 同样优先使用 Validation 传入的 mask
+            if targets_dict and 'mask_past' in targets_dict:
+                mask_past_infer = targets_dict['mask_past']
+                masks_stages_infer = targets_dict['masks_stages']
+            else:
+                mask_past_infer = mask_past
+                masks_stages_infer = masks_stages
+
             sampled_x = self.diffusion.predict(
                 x_0=torch.zeros((B, self.n_query, self.diff_out_dim), device=self.device),
                 obs=obs_cond,
-                mask_past=mask_past,
-                masks_stages=masks_stages,
+                mask_past=mask_past_infer,
+                masks_stages=masks_stages_infer,
                 n_samples=10, 
                 n_diffusion_steps=self.diffusion.ddim_timesteps
             )

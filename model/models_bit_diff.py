@@ -1,11 +1,11 @@
-import torch
+import torch #(v3)
 import torch.nn as nn
 import copy
 import math
 from einops import rearrange
 
 # ==========================================
-# [修复] 正确的 try-except 格式
+# v3
 # ==========================================
 try:
     from utils import *
@@ -56,9 +56,19 @@ class BitDiffPredictorTCN(nn.Module):
         x = rearrange(x, "b t c -> b c t")
         
         # [关键修复] Mask 处理
-        # stage_masks 中的 mask 也是 [B, T, 1]，需要转为 [B, 1, T] 以匹配 concatenation
+        # stage_masks 中的 mask 可能是 [B, T, C] (例如 C=11)，但在模型内部拼接时
+        # 需要与 mask_obs [B, 1, T] 保持通道一致。
+        # 因此这里强制取第一个通道，转为 [B, 1, T]。
         if stage_masks is not None:
-            stage_masks = [rearrange(m, "b t c -> b c t") for m in stage_masks]
+            new_masks = []
+            for m in stage_masks:
+                # m: [B, T, C]
+                if m.shape[-1] > 1:
+                    m = m[..., 0:1] # 只取第一个 channel -> [B, T, 1]
+                
+                m = rearrange(m, "b t c -> b c t") # -> [B, 1, T]
+                new_masks.append(m)
+            stage_masks = new_masks
         
         # obs_cond: [B, S, C_in] -> [B, C_in, S]
         if obs_cond is not None:
@@ -165,7 +175,7 @@ class DiffSingleStageModel(nn.Module):
     def forward(self, x, t, mask, obs_cond=None):
         # x: [B, C_x, T_future] (Noisy input)
         # obs_cond: [B, C_obs, T_past] (Condition)
-        # mask: [B, 1, T_future]
+        # mask: [B, 1, T_future] (已确保为单通道)
         
         # 1. 投影
         x_emb = self.x_proj(x) # [B, D, T_future]
@@ -183,6 +193,7 @@ class DiffSingleStageModel(nn.Module):
             mask_obs = torch.ones((B, 1, T_past), device=x.device)
             
             # 拼接 Mask -> [B, 1, T_past + T_future]
+            # [Fix] 现在 mask 也是 [B, 1, T_future]，可以正常拼接
             mask_combined = torch.cat([mask_obs, mask], dim=2)
         else:
             h = x_emb
@@ -202,6 +213,7 @@ class DiffSingleStageModel(nn.Module):
         out_future = out[:, :, -T_future:] # 取最后 T_future 帧
 
         # 6. Output Projection
+        # mask [B, 1, T] 可以广播到 [B, C, T]
         out_features = out_future * mask
         out_logits = self.conv_out(out_future) * mask
         

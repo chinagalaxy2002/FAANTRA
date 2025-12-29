@@ -1,4 +1,5 @@
-import torch
+import torch #(v3)
+import torch.nn.functional as F
 import os
 import wandb
 from dataset.datasets import STRIDE_SNB
@@ -47,9 +48,6 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
         train_loop = tqdm(train_loader)
         
         for i, data in enumerate(train_loop):
-            # if i >= 5:
-            #     print("【DEBUG模式】强制跳出训练循环，进入验证阶段...")
-            #     break 
             step_log_dict = {"train/step": epoch*len(train_loader) + i+1}
             postfix_kwargs = {"loss": 0}
             optimizer.zero_grad()
@@ -67,16 +65,39 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
             target_off = trans_off_future * trans_off_future_mask 
             target = trans_future_target
             
-            # 3. 构造 Diffusion 输入
-            targets_dict = {
-                'action': target,
-                'offset': target_off,
-                'actionness': target_actionness if (use_actionness or BCE_with_actionness) else None
+            # 3. 构造 Diffusion 输入 (适配 SeqConcat 架构)
+            # -----------------------------------------------------------------
+            # 创建 Future Padding Mask (B, T_future, 1)
+            future_mask = (target != pad_idx).unsqueeze(-1).float()
+
+            # 构造 x_0 (Target converted to One-Hot)
+            safe_target = target.clone()
+            safe_target[target == pad_idx] = 0 
+            
+            x_0_onehot = F.one_hot(safe_target.long(), num_classes=n_class).float() 
+            
+            # [修改] 构造 masks_stages
+            # 不再重复 channel，保持 (B, T, 1)，利用广播机制匹配 Diffusion 输出的 13 通道
+            masks_stages = [future_mask]
+
+            # 组装 Batch 字典
+            inputs = {
+                'x_0': x_0_onehot,
+                'obs': features,            # Past Features
+                'mask_past': future_mask,   # Future Padding Mask
+                'masks_stages': masks_stages,
+                
+                # 辅助任务数据
+                'action_target': target, 
+                'offset_target': target_off,
+                'actionness_target': target_actionness if (use_actionness or BCE_with_actionness) else None,
+                'past_label': past_label,
+                'mode': 'train'
             }
-            inputs = (features, targets_dict)
+            # -----------------------------------------------------------------
 
             # 4. Forward
-            outputs = model(inputs, mode='train')
+            outputs = model(inputs)
             losses = 0
 
             # Diffusion 逻辑判断
@@ -92,7 +113,6 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
             if args.seg and 'seg' in outputs:
                 output_seg = outputs['seg']
                 B, T, C = output_seg.size()
-                # [Fix] use reshape
                 output_seg = output_seg.reshape(-1, C).to(device)
                 target_past_label = past_label.reshape(-1) 
                 class_weights = torch.tensor(args.class_weights, device=device)
@@ -119,22 +139,22 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
             if args.anticipate:
                 do_calc_loss = not is_diffusion 
 
-                output = outputs['action']
+                output = outputs['action'] 
+                
                 if args.CALF_matching:
                     if args.CALF_probability_matching:
-                        output, output_off, output_actionness = CALF_matching2(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
-                                                                               output_actionness=outputs['actionness'] if use_actionness else None,
+                        output, output_off, output_actionness = CALF_matching2(output, target, outputs.get('offset'), target_off, pad_idx, use_actionness=use_actionness,
+                                                                               output_actionness=outputs.get('actionness') if use_actionness else None,
                                                                                target_actionness=target_actionness if use_actionness else None)
                     else:
-                        output, output_off, output_actionness = CALF_matching(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
-                                                                              output_actionness=outputs['actionness'] if use_actionness else None,
+                        output, output_off, output_actionness = CALF_matching(output, target, outputs.get('offset'), target_off, pad_idx, use_actionness=use_actionness,
+                                                                              output_actionness=outputs.get('actionness') if use_actionness else None,
                                                                               target_actionness=target_actionness if use_actionness else None)
                 else:
-                    output_off = outputs['offset']
-                    if use_actionness: output_actionness = outputs['actionness']
+                    output_off = outputs.get('offset')
+                    if use_actionness: output_actionness = outputs.get('actionness')
 
                 B, T, C = output.size()
-                # [Fix] use reshape
                 output = output.reshape(-1, C).to(device)
                 target = target.contiguous().view(-1)
 
@@ -143,11 +163,9 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                 class_weights[0] = args.eos_weight
                 
                 if use_actionness or BCE_with_actionness:
-                    # 切片 output，去掉背景类，与 10 类权重对齐
                     output_for_loss = output[:, 1:]
                     loss, n_correct, n_total, class_stats = cal_performance(output_for_loss, target, pad_idx, loss_func=loss_func, class_weights=class_weights[1:], actionness=True, calc_loss=do_calc_loss)
                     
-                    # 修正 class_stats 的 Key
                     new_stats = {}
                     for k, v in class_stats.items():
                         new_stats[k+1] = v
@@ -158,48 +176,52 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                 
                 acc = 1 if n_total == 0 else n_correct / n_total
                 
-                if not is_diffusion:
+                if not is_diffusion and loss is not None:
                     loss = torch.nan_to_num(loss)
                     losses += loss
                     step_log_dict["train/CE_loss"] = loss.item()
                     postfix_kwargs["loss_CE"] = loss.item()
+                    epoch_loss_class += loss.item()
 
                 total_class += n_total
                 total_class_correct += n_correct
-                if not is_diffusion: epoch_loss_class += loss.item()
                 
                 # Offset processing
-                output_off = output_off if args.CALF_matching else outputs['offset']
-                transformed_output_off = normalize_offset(output_off, trans_off_future_mask, num_pred_frames)
-                transformed_target_off = normalize_offset(target_off, trans_off_future_mask, num_pred_frames)
-                
-                if not is_diffusion:
-                    if torch.sum(trans_off_future_mask) == 0:
-                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off))
-                    else:
-                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / torch.sum(trans_off_future_mask)
-                    loss_off *= offset_loss_weight
-                    losses += loss_off
-                    epoch_loss_off += loss_off.item()
-                    step_log_dict["train/offset_loss"] = loss_off.item()
+                if output_off is not None:
+                    output_off = output_off if args.CALF_matching else outputs['offset']
+                    
+                    if not is_diffusion:
+                        transformed_output_off = normalize_offset(output_off, trans_off_future_mask, num_pred_frames)
+                        transformed_target_off = normalize_offset(target_off, trans_off_future_mask, num_pred_frames)
+                        
+                        if torch.sum(trans_off_future_mask) == 0:
+                            loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off))
+                        else:
+                            loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / torch.sum(trans_off_future_mask)
+                        loss_off *= offset_loss_weight
+                        losses += loss_off
+                        epoch_loss_off += loss_off.item()
+                        step_log_dict["train/offset_loss"] = loss_off.item()
 
-                # Offset Accuracy
-                # [Fix] use reshape
-                unrolled_output_off = output_off.reshape(-1)
-                unrolled_target_off = target_off.view(-1)
-                unrolled_off_mask = trans_off_future_mask.view(-1)
-                off_correct = 0
-                for d in range(len(unrolled_target_off)):
-                    if unrolled_off_mask[d]:
-                        if (unrolled_output_off[d] - unrolled_target_off[d]).abs() <= FPS_SN/STRIDE_SNB:
-                            off_correct += 1
+                    # Offset Accuracy
+                    unrolled_output_off = output_off.reshape(-1)
+                    unrolled_target_off = target_off.view(-1)
+                    unrolled_off_mask = trans_off_future_mask.view(-1)
+                    off_correct = 0
+                    for d in range(len(unrolled_target_off)):
+                        if unrolled_off_mask[d]:
+                            if (unrolled_output_off[d] - unrolled_target_off[d]).abs() <= FPS_SN/STRIDE_SNB:
+                                off_correct += 1
+                    total_off_correct += off_correct
+                    step_log_dict["train/offset_acc@1s"] = 1 if n_total == 0 else off_correct/n_total
+                    postfix_kwargs["acc_offset"] = 1 if n_total == 0 else off_correct/n_total
                 
                 # Actionness
-                if use_actionness:
+                if use_actionness and output_actionness is not None:
                     output_actionness = output_actionness if args.CALF_matching else outputs['actionness']
-                    # [Fix] use reshape (这是您报错的地方之一)
                     output_actionness = output_actionness.reshape(-1).to(device)
                     target_actionness = target_actionness.contiguous().view(-1)
+                    
                     actionness_loss, actionness_stats = cal_actionness_performance(output_actionness, target_actionness, threshold=0.5)
                     
                     if not is_diffusion:
@@ -209,13 +231,16 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                     total = actionness_stats["TP"] + actionness_stats["TN"] + actionness_stats["FP"] + actionness_stats["FN"]
                     step_log_dict["train/actionness_acc"] = (actionness_stats["TP"] + actionness_stats["TN"]) / total if total > 0 else 0
                     postfix_kwargs["acc_actionness"] = (actionness_stats["TP"] + actionness_stats["TN"]) / (total + 1e-8)
+                    
+                    if epoch_actionness_stats is None:
+                        epoch_actionness_stats = actionness_stats
+                    else:
+                        for stat_key in actionness_stats.keys():
+                            epoch_actionness_stats[stat_key] += actionness_stats[stat_key]
 
                 # Stats update
-                total_off_correct += off_correct
                 step_log_dict["train/CE_acc"] = acc
-                step_log_dict["train/offset_acc@1s"] = 1 if n_total == 0 else off_correct/n_total
                 postfix_kwargs["acc_ant"] = acc
-                postfix_kwargs["acc_offset"] = 1 if n_total == 0 else off_correct/n_total
 
                 if epoch_class_stats is None:
                     epoch_class_stats = class_stats
@@ -224,12 +249,6 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                         for class_stat in class_stats[class_key].keys():
                             epoch_class_stats[class_key][class_stat] += class_stats[class_key][class_stat]
                 
-                if use_actionness:
-                    if epoch_actionness_stats is None:
-                        epoch_actionness_stats = actionness_stats
-                    else:
-                        for stat_key in actionness_stats.keys():
-                            epoch_actionness_stats[stat_key] += actionness_stats[stat_key]
 
             # Backprop
             epoch_loss += losses.item()
@@ -286,16 +305,40 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
 
                 target_off = trans_off_future*trans_off_future_mask 
                 target = trans_future_target
-                inputs = features
 
-                outputs = model(inputs, mode="validation")
+                # 构造 Validation Inputs (与 Train 保持一致)
+                # -----------------------------------------------------------
+                future_mask = (target != pad_idx).unsqueeze(-1).float()
+                safe_target = target.clone()
+                safe_target[target == pad_idx] = 0 
+                x_0_onehot = F.one_hot(safe_target.long(), num_classes=n_class).float()
+                
+                # [修改] Validation 中也去掉 channel repeat
+                masks_stages = [future_mask]
+
+                inputs = {
+                    'x_0': x_0_onehot,
+                    'obs': features,
+                    'mask_past': future_mask,
+                    'masks_stages': masks_stages,
+                    'action_target': target,
+                    'offset_target': target_off,
+                    'actionness_target': target_actionness,
+                    'past_label': past_label,
+                    'mode': 'validation'
+                }
+                # -----------------------------------------------------------
+
+                outputs = model(inputs)
                 losses = 0
+                
+                # Diffusion Check for Validation
+                is_diffusion = 'loss' in outputs 
                 
                 # Seg Task
                 if args.seg and 'seg' in outputs:
                     output_seg = outputs['seg']
                     B, T, C = output_seg.size()
-                    # [Fix] use reshape
                     output_seg = output_seg.reshape(-1, C).to(device)
                     target_past_label = past_label.reshape(-1)
                     class_weights = torch.tensor(args.class_weights, device=device)
@@ -323,20 +366,19 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                     output = outputs['action']
                     if args.CALF_matching:
                         if args.CALF_probability_matching:
-                            output, output_off, output_actionness = CALF_matching2(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
-                                                                                   output_actionness=outputs['actionness'] if use_actionness else None,
+                            output, output_off, output_actionness = CALF_matching2(output, target, outputs.get('offset'), target_off, pad_idx, use_actionness=use_actionness,
+                                                                                   output_actionness=outputs.get('actionness') if use_actionness else None,
                                                                                    target_actionness=target_actionness if use_actionness else None)
                         else:
-                            output, output_off, output_actionness = CALF_matching(output, target, outputs['offset'], target_off, pad_idx, use_actionness=use_actionness,
-                                                                                  output_actionness=outputs['actionness'] if use_actionness else None,
+                            output, output_off, output_actionness = CALF_matching(output, target, outputs.get('offset'), target_off, pad_idx, use_actionness=use_actionness,
+                                                                                  output_actionness=outputs.get('actionness') if use_actionness else None,
                                                                                   target_actionness=target_actionness if use_actionness else None)
                     else:
-                        output_off = outputs['offset']
-                        if use_actionness: output_actionness = outputs['actionness']
+                        output_off = outputs.get('offset')
+                        if use_actionness: output_actionness = outputs.get('actionness')
 
                     B, T, C = output.size()
                     
-                    # [Fix] use reshape
                     output = output.reshape(-1, C).to(device)
                     target = target.contiguous().view(-1)
                     
@@ -345,65 +387,68 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                     class_weights[0] = args.eos_weight
                     
                     if use_actionness or BCE_with_actionness:
-                        # 切片 output，去掉背景类，与 10 类权重对齐 (Loss计算用)
                         output_for_loss = output[:, 1:]
                         loss, n_correct, n_total, class_stats = cal_performance(output_for_loss, target, pad_idx, loss_func=loss_func, class_weights=class_weights[1:], actionness=True)
-                        
-                        # 修正 class_stats 的 Key
                         new_stats = {}
                         for k, v in class_stats.items():
                             new_stats[k+1] = v
                         class_stats = new_stats
-
                     else:
                         loss, n_correct, n_total, class_stats = cal_performance(output, target, pad_idx, loss_func=loss_func, class_weights=class_weights, actionness=use_actionness)
                     
                     acc = 1 if n_total == 0 else n_correct / n_total
                     
-                    loss = torch.nan_to_num(loss)
-                    losses += loss
+                    if loss is not None:
+                        loss = torch.nan_to_num(loss)
+                        losses += loss
+                        val_epoch_loss_class += loss.item()
+                        step_log_dict["val/CE_loss"] = loss.item()
+
                     val_total_class += n_total
                     val_total_class_correct += n_correct
-                    val_epoch_loss_class += loss.item()
 
                     # Offset
-                    output_off = output_off if args.CALF_matching else outputs['offset']
-                    transformed_output_off = normalize_offset(output_off, trans_off_future_mask, num_pred_frames)
-                    transformed_target_off = normalize_offset(target_off, trans_off_future_mask, num_pred_frames)
-                    
-                    if torch.sum(trans_off_future_mask) == 0:
-                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off))
-                    else:
-                        loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / torch.sum(trans_off_future_mask)
-                    loss_off *= offset_loss_weight
-                    losses += loss_off
-                    val_epoch_loss_off += loss_off.item()
-                    
-                    # [Fix] use reshape
-                    unrolled_output_off = output_off.reshape(-1)
-                    unrolled_target_off = target_off.view(-1)
-                    unrolled_off_mask = trans_off_future_mask.view(-1)
-                    off_correct = 0
-                    for d in range(len(unrolled_target_off)):
-                        if unrolled_off_mask[d]:
-                            if (unrolled_output_off[d] - unrolled_target_off[d]).abs() <= 25/STRIDE_SNB:
-                                off_correct += 1
+                    if output_off is not None:
+                        output_off = output_off if args.CALF_matching else outputs['offset']
+                        transformed_output_off = normalize_offset(output_off, trans_off_future_mask, num_pred_frames)
+                        transformed_target_off = normalize_offset(target_off, trans_off_future_mask, num_pred_frames)
+                        
+                        if torch.sum(trans_off_future_mask) == 0:
+                            loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off))
+                        else:
+                            loss_off = torch.sum(criterion(transformed_output_off, transformed_target_off)) / torch.sum(trans_off_future_mask)
+                        loss_off *= offset_loss_weight
+                        losses += loss_off
+                        val_epoch_loss_off += loss_off.item()
+                        
+                        unrolled_output_off = output_off.reshape(-1)
+                        unrolled_target_off = target_off.view(-1)
+                        unrolled_off_mask = trans_off_future_mask.view(-1)
+                        off_correct = 0
+                        for d in range(len(unrolled_target_off)):
+                            if unrolled_off_mask[d]:
+                                if (unrolled_output_off[d] - unrolled_target_off[d]).abs() <= 25/STRIDE_SNB:
+                                    off_correct += 1
+                        val_total_off_correct += off_correct
+                        step_log_dict["val/offset_loss"] = loss_off.item()
+                        step_log_dict["val/offset_acc@1s"] = 1 if n_total == 0 else off_correct/n_total
                     
                     # Actionness
-                    if use_actionness:
+                    if use_actionness and output_actionness is not None:
                         output_actionness = output_actionness if args.CALF_matching else outputs['actionness']
-                        # [Fix] use reshape (这是您之前报错的地方，必须改)
                         output_actionness = output_actionness.reshape(-1).to(device)
                         target_actionness = target_actionness.contiguous().view(-1)
                         actionness_loss, actionness_stats = cal_actionness_performance(output_actionness, target_actionness, threshold=0.5)
                         losses += actionness_loss
                         val_epoch_loss_actionness += actionness_loss.item()
+                        
+                        if val_epoch_actionness_stats is None:
+                            val_epoch_actionness_stats = actionness_stats
+                        else:
+                            for stat_key in actionness_stats.keys():
+                                val_epoch_actionness_stats[stat_key] += actionness_stats[stat_key]
 
-                    val_total_off_correct += off_correct
                     step_log_dict["val/CE_acc"] = acc
-                    step_log_dict["val/CE_loss"] = loss.item()
-                    step_log_dict["val/offset_loss"] = loss_off.item()
-                    step_log_dict["val/offset_acc@1s"] = 1 if n_total == 0 else off_correct/n_total
                     
                     if val_epoch_class_stats is None:
                         val_epoch_class_stats = class_stats
@@ -411,12 +456,6 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                         for class_key in class_stats.keys():
                             for class_stat in class_stats[class_key].keys():
                                 val_epoch_class_stats[class_key][class_stat] += class_stats[class_key][class_stat]
-                    if use_actionness:
-                        if val_epoch_actionness_stats is None:
-                            val_epoch_actionness_stats = actionness_stats
-                        else:
-                            for stat_key in actionness_stats.keys():
-                                val_epoch_actionness_stats[stat_key] += actionness_stats[stat_key]
 
 
                 val_epoch_loss += losses.item()
