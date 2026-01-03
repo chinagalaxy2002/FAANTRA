@@ -1,484 +1,329 @@
-"""
-https://github.com/lucidrains/denoising-diffusion-pytorch  v3
-"""
-import math
-from collections import namedtuple
-
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from einops import repeat, rearrange
-from torch import nn
+import math
 from tqdm import tqdm
-
-ModelPrediction = namedtuple("ModelPrediction", ["pred_noise", "pred_x_start"])
-
+from functools import partial
+from inspect import isfunction
+from einops import repeat
 
 def exists(x):
     return x is not None
 
-
-def identity(t, *args, **kwargs):
-    return t
-
-
 def default(val, d):
     if exists(val):
         return val
-    return d() if callable(d) else d
-
-
-def has_int_squareroot(num):
-    return (math.sqrt(num) ** 2) == num
-
+    return d() if isfunction(d) else d
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
     out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))  # B x 1 x 1 
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-
-def linear_beta_schedule(timesteps):
-    scale = 1000 / timesteps
-    beta_start = scale * 0.0001
-    beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float64)
-
-
-def l2norm(t):
-    return F.normalize(t, dim=-1)
-
-
-def cosine_beta_schedule(timesteps, s=0.008):
-    """
-    cosine schedule
-    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
-    """
+def cosine_beta_schedule(timesteps, s = 0.008):
     steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+    x = torch.linspace(0, timesteps, steps)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
-
-class DiffusionModel(nn.Module):
-    """
-    Template model for the diffusion process
-    """
-
-    def __init__(
-        self,
-    ):
-        super().__init__()
-
-
-    def forward(self, X_0, X_t, batch):
-        raise NotImplementedError("Nope")
-
+from collections import namedtuple
+ModelPrediction = namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 class GaussianBitDiffusion(nn.Module):
     def __init__(
         self,
-        model: nn.Module,
-        condition_x0:False,
+        model,
         *,
-        num_classes=48,
-        timesteps=1000,  
-        ddim_timesteps=10,
-        betas=None,
-        loss_type="l2",
-        objective="pred_x0",
-        beta_schedule="cosine",
+        num_classes, # 注意：这里的 num_classes 实际上是 Diff 输出的维度 (现在仅为动作类别数)
+        timesteps = 1000,
+        ddim_timesteps = 50,
+        loss_type = 'l2',
+        objective = 'pred_x0',
+        beta_schedule = 'cosine',
+        condition_x0 = False 
     ):
-        
         super().__init__()
-        print('Bit Diffusion (Modified for FAANTRA SeqConcat)')
-        print(f'Num classes : {num_classes}')
-        print(f'Loss type : {loss_type}')
-        print(f'Objective: {objective}')
-        print(f'Beta schedule : {beta_schedule}')
-
         self.model = model
         self.num_classes = num_classes
-        self.condition_x0 = condition_x0
-
-        # RECONSTRUCTION OBJ
         self.objective = objective
-        self.loss_type = loss_type
-
-        assert objective in {
-            "pred_noise",
-            "pred_x0",
-        }, "objective must be either pred_noise (predict noise) or pred_x0(predict image start)"  # noqa E501
-
-
-        # VARIANCE
-        if betas is None:
-            if beta_schedule == "linear":
-                betas = linear_beta_schedule(timesteps)
-            elif beta_schedule == "cosine":
-                betas = cosine_beta_schedule(timesteps)
-            else:
-                raise ValueError(f"unknown beta schedule {beta_schedule}")
-
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
-
-
-        # SAMPLING
-        (timesteps,) = betas.shape
+        self.condition_x0 = condition_x0
+        
+        # [修复] 显式保存 num_timesteps
         self.num_timesteps = int(timesteps)
+        self.timesteps = int(timesteps)
 
-        # PARAMS
-        def register_buffer(name, val):
-            return self.register_buffer(name, val.to(torch.float32))
-
-        register_buffer("betas", betas)
-        register_buffer("alphas_cumprod", alphas_cumprod)
-        register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
-
-        # FORWARD DIFFUSION q(x_t | x_{t-1}) 
-        register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
-        register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
-        register_buffer("log_one_minus_alphas_cumprod", torch.log(1.0 - alphas_cumprod))
-        register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod))
-        register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1))
-
-
-        # POSTERIOR q(x_{t-1} | x_t, x_0)
-        posterior_variance = (betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod))
-        register_buffer("posterior_variance", posterior_variance)
-        register_buffer("posterior_log_variance_clipped", torch.log(posterior_variance.clamp(min=1e-20)),)
-        register_buffer("posterior_mean_coef1", betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod),)
-        register_buffer("posterior_mean_coef2", (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod),)
-
-        # DDIM
-        self.eta = 0.
-        c = timesteps // ddim_timesteps
-        ddim_timestep_seq = np.asarray(list(range(0, timesteps, c)))
-        self.ddim_timesteps = ddim_timesteps
-        self.ddim_timestep_seq = ddim_timestep_seq
-    
-
-    @property
-    def loss_fn(self):
-        if self.loss_type == "l2":
-            return F.mse_loss
+        if beta_schedule == 'linear':
+            betas = torch.linspace(0.0001, 0.02, timesteps)
+        elif beta_schedule == 'cosine':
+            betas = cosine_beta_schedule(timesteps)
         else:
-            raise ValueError(f"invalid loss type {self.loss_type}")
+            raise ValueError(f'unknown beta schedule {beta_schedule}')
 
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
+
+        self.ddim_timesteps = ddim_timesteps
+
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+        register_buffer('posterior_variance', betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_log_variance_clipped', torch.log(self.posterior_variance.clamp(min =1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+        self.loss_fn = F.mse_loss if loss_type == 'l2' else F.l1_loss
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
-            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-          - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
-
-    def predict_noise_from_start(self, x_t, t, x0):
+    def predict_noise_from_start(self, x_t, t, x_0):
         return (
-            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0
-        ) / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-
-
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x_0) /
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        )
 
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
-              extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract(
-            self.posterior_log_variance_clipped, t, x_t.shape
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def model_predictions(self, x, pred_x_start_prev, t, obs, stage_masks):
+        # [修改] 调用 Model，返回字典
+        model_output = self.model(x, t, stage_masks, obs_cond=obs)
+        
+        # 解析输出
+        # model 返回的是 { 'action': ..., 'offset': ..., 'actionness': ..., ... }
+        # 取最后一层 (Stage) 的输出
+        pred_action = model_output['action'][-1] if model_output['action'] is not None else None
+        pred_offset = model_output['offset'][-1] if model_output['offset'] is not None else None
+        pred_act = model_output['actionness'][-1] if model_output['actionness'] is not None else None
+
+        # 根据 Diffusion Objective 计算 pred_x_start 和 pred_noise
+        if self.objective == 'pred_noise':
+            pred_noise = pred_action
+            pred_x_start = self.predict_start_from_noise(x, t, pred_noise)
+            # 应用 Mask (假设 stage_masks 是 list, 取最后一个)
+            if isinstance(stage_masks, list):
+                pred_x_start = pred_x_start * stage_masks[-1]
+            else:
+                pred_x_start = pred_x_start * stage_masks
+
+        elif self.objective == 'pred_x0':
+            pred_x_start = pred_action
+            pred_noise = self.predict_noise_from_start(x, t, pred_x_start)
+            # 应用 Mask
+            if isinstance(stage_masks, list):
+                pred_noise = pred_noise * stage_masks[-1]
+            else:
+                pred_noise = pred_noise * stage_masks
+
+        # 返回 (Diffusion结果), Offset, Actionness
+        return ModelPrediction(pred_noise, pred_x_start), pred_offset, pred_act
+
+    def p_mean_variance(self, x, pred_x_start_prev, t, obs, stage_masks):
+        preds, _, _ = self.model_predictions(x, pred_x_start_prev, t, obs, stage_masks)
+        pred_x_start = preds.pred_x_start
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=pred_x_start, x_t=x, t=t)
+        return model_mean, posterior_variance, posterior_log_variance, pred_x_start
+
+    # [修改] p_sample_ddim 现在需要返回 Offset 和 Actionness
+    @torch.no_grad()
+    def p_sample_ddim(self, x, pred_x_start_prev, t, t_prev, obs, stage_masks, eta=0.):
+        # 获取预测
+        preds, pred_offset, pred_act = self.model_predictions(x, pred_x_start_prev, t, obs, stage_masks)
+        pred_noise = preds.pred_noise
+        pred_x_start = preds.pred_x_start
+
+        # DDIM 计算逻辑
+        alpha = extract(self.alphas_cumprod, t, x.shape)
+        alpha_prev = extract(self.alphas_cumprod, t_prev, x.shape)
+        sigma = eta * torch.sqrt((1 - alpha_prev) / (1 - alpha) * (1 - alpha / alpha_prev))
+        
+        pred_x_start = pred_x_start.clamp(-1., 1.)
+        mean_pred = pred_x_start * torch.sqrt(alpha_prev) + torch.sqrt(1 - alpha_prev - sigma ** 2) * pred_noise
+        
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        noise = torch.randn_like(x)
+        
+        x_prev = mean_pred + nonzero_mask * sigma * noise
+        
+        # 返回: 下一步状态 x_{t-1}, 以及当前步的各项预测
+        return x_prev, pred_x_start, pred_offset, pred_act
+
+    @torch.no_grad()
+    def p_sample(self, x, pred_x_start_prev, t, obs, stage_masks):
+        b, *_, device = *x.shape, x.device
+        model_mean, _, model_log_variance, pred_x_start = self.p_mean_variance(x, pred_x_start_prev, t, obs, stage_masks)
+        noise = torch.randn_like(x)
+        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise, pred_x_start
+
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-        return (
-            posterior_mean,
-            posterior_variance,
-            posterior_log_variance_clipped,
-        )  
-
-
-
-    # SAMPLE from q(x_t | x_o)
-    def q_sample(self, x_start, t, noise=None):
-        """
-        :param x_start: {B x T x C}
-        """
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        return ( extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-        + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
-
-  
-    # PREDICTION and LOSSES
+    # [修改] p_losses 接收 targets 并计算多任务 Loss
     def p_losses(self,
                 t,
-                x_0,
+                x_0, # 仅 Action Class
                 obs,
                 mask_all,
                 mask_past,
+                offset_target=None,
+                actionness_target=None,
+                offset_loss_weight=1.0,
                 noise=None):
         
-        # SAMPLE x_t from q(x_t | x_o)
         x_start = x_0
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-
-        # OBSERVATION CONDITIONING
-        # [修改] 移除 mask_past 的乘法，防止维度不匹配。
-        # 在时间拼接架构下，obs 是 Past Feature，长度与 mask_past (Future Mask) 不同。
         obs_cond = obs  
 
-        # SELF-CONDITIONING
-        self_cond = torch.zeros_like(x_0).to(x_0.device)
-        if torch.rand((1)) < 0.5 and self.condition_x0:
-            with torch.no_grad():
-                self_cond = self.model(
-                    x=x_t, 
-                    t=t, 
-                    stage_masks=mask_all,
-                    obs_cond=obs_cond, 
-                    self_cond=self_cond
-                )[-1]
-                self_cond = self_cond.detach()
-
-                    
-        # REVERSE STEP
+        # model_out 是字典
         model_out = self.model(
             x=x_t,
             t=t,
             stage_masks=mask_all,
-            obs_cond=obs_cond,
-            self_cond=self_cond
-        )  # S x B x T x C
-
-
-        # LOSS
-        if self.objective == "pred_noise":
-            target = noise
-        elif self.objective == "pred_x0":
-            target = x_0 
-        else:
-            raise ValueError(f"unknown objective {self.objective}")
+            obs_cond=obs_cond
+        )
         
+        # 提取最后一层输出
+        pred_action = model_out['action'][-1]     # [B, T, C]
+        pred_offset = model_out['offset'][-1] if model_out['offset'] is not None else None
+        pred_actionness = model_out['actionness'][-1] if model_out['actionness'] is not None else None
 
-        if self.loss_type == 'l2':
-            target = repeat(target, 'b t c -> s b t c', s=model_out.shape[0])
-            if isinstance(mask_all, list):
-                mask_all = torch.stack(mask_all, dim=0)
+        # 1. Diffusion Loss (只针对 Class)
+        if self.objective == "pred_noise":
+            target_diff = noise
+        elif self.objective == "pred_x0":
+            target_diff = x_0 
+            
+        # 确保 mask 维度正确
+        if isinstance(mask_all, list):
+            mask_use = mask_all[-1] # 取最后一层 mask
+        else:
+            mask_use = mask_all
+            
+        loss_diff = self.loss_fn(pred_action, target_diff, reduction="none")
+        # 简单平均: Mean over (Batch, Time, Channels)
+        loss_diff = torch.mean(loss_diff * mask_use)
 
-            loss = self.loss_fn(model_out, target, reduction="none")  # S x B x T x C
-            loss = torch.sum(torch.mean(loss * mask_all, dim=(2, 3)))
+        total_loss = loss_diff
 
-        # OUT
-        # [修改] 返回字典以适配 train.py 多任务处理
+        # 2. Offset Loss (辅助任务)
+        if pred_offset is not None and offset_target is not None:
+            # offset_target: [B, T, 1]
+            loss_off = F.mse_loss(pred_offset, offset_target, reduction="none")
+            loss_off = torch.mean(loss_off * mask_use)
+            total_loss = total_loss + (loss_off * offset_loss_weight)
+            
+        # 3. Actionness Loss (辅助任务)
+        if pred_actionness is not None and actionness_target is not None:
+            # actionness_target: [B, T, 1]
+            loss_act = F.mse_loss(pred_actionness, actionness_target, reduction="none")
+            loss_act = torch.mean(loss_act * mask_use)
+            total_loss = total_loss + loss_act 
+            
         return {
-            "loss": loss,
-            "action": model_out[-1], # 用于 Acc 计算
+            "loss": total_loss,
+            "action": pred_action, # 返回 Class 预测用于 Log
+            "offset": pred_offset,
+            "actionness": pred_actionness,
             "x_t": x_t
         }
 
-
-
-    def forward(self, batch, *args, **kwargs):
-        x_0 = batch['x_0']  # one-hot class labels
-        obs = batch['obs']  # padded observed features
+    # [修改] predict 收集所有输出并拼接
+    def predict(self,
+                x_0, # 初始噪声形状的 tensor (仅包含 Class)
+                obs,
+                mask_past,
+                masks_stages,
+                n_samples=1, 
+                n_diffusion_steps=50):
         
-        masks_stages = batch['masks_stages']
-        # masks_stages = [mask.to(torch.bool) for mask in masks_stages]
-        masks_stages = [mask.to(x_0.device) for mask in masks_stages]
-
-        mask_past = batch['mask_past']
-        mask_past = mask_past.to(torch.bool)
+        # x_0 shape: [B, T, C_class]
+        B, T, C = x_0.shape
         
-        # 修正 mask 维度以匹配 x_0 (B, T_future, C)
-        if mask_past.shape[-1] != x_0.shape[-1]:
-             mask_past = repeat(mask_past, 'b t 1 -> b t c', c=x_0.shape[-1])
-
-        # get random diff timestep
-        t = torch.randint(0, self.num_timesteps, (obs.size(0),), device=obs.device).long()
-
-        return self.p_losses(
-            t = t,
-            x_0 = x_0,
-            obs = obs,
-            mask_past = mask_past,
-            mask_all = masks_stages,
-            *args, **kwargs
-        )
-
- 
-
-    # ---------------------------------- INFERENCE (DDIM) --------------------------------------
-
-    def model_predictions(self, x, pred_x_start_prev, t, obs, stage_masks):
-        x_t = x
-
-        # Given x_t, reconsturct x_0
-        self_cond = torch.zeros_like(pred_x_start_prev).to(pred_x_start_prev.device)
-        if self.condition_x0:
-            self_cond = pred_x_start_prev
-          
-          
-        # PRED
-        model_output = self.model(
-            x=x_t,
-            t=t,
-            stage_masks=stage_masks,
-            obs_cond=obs,
-            self_cond=self_cond
-        )[-1]
+        # 扩展样本维度
+        # obs: [B, S, C] -> [samples*B, S, C]
+        obs = repeat(obs, 'b t c -> (s b) t c', s=n_samples)
         
-        if self.objective == "pred_noise":
-            pred_noise = model_output 
-            pred_x_start = self.predict_start_from_noise(x, t, pred_noise) * stage_masks[-1]
-            
-        elif self.objective == "pred_x0":
-            pred_x_start = model_output
-            pred_noise = self.predict_noise_from_start(x, t, pred_x_start) * stage_masks[-1]
-            
-        return ModelPrediction(pred_noise, pred_x_start)
-
-
-
-    @torch.no_grad()
-    def p_sample_ddim(
-        self,
-        x,
-        pred_x_start_prev,
-        t,
-        t_prev,
-        batch,
-        if_prev=False
-    ):
-        
-        # [修改] 移除 batch['mask_past'] 的乘法
-        obs_input = batch['obs'] 
-
-        # MODEL PRED
-        preds = self.model_predictions(x=x,
-                                       pred_x_start_prev=pred_x_start_prev,
-                                       t=t,
-                                       obs=obs_input,
-                                       stage_masks=batch['mask_all'])
-        pred_x_start = preds.pred_x_start
-        pred_noise = preds.pred_noise
-
-        # PRED X_0
-        alpha_bar = extract(self.alphas_cumprod, t, x.shape)
-        if if_prev:
-            alpha_bar_prev = extract(self.alphas_cumprod_prev, t_prev, x.shape)
+        # mask
+        if isinstance(masks_stages, list):
+            masks_stages = [repeat(m, 'b t c -> (s b) t c', s=n_samples) for m in masks_stages]
         else:
-            alpha_bar_prev = extract(self.alphas_cumprod, t_prev, x.shape)
-        sigma = (
-                self.eta
-                * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
-                * torch.sqrt(1 - alpha_bar / alpha_bar_prev)
-        )
+            masks_stages = repeat(masks_stages, 'b t c -> (s b) t c', s=n_samples)
+            
+        mask_past = repeat(mask_past, 'b t c -> (s b) t c', s=n_samples)
 
-        # Compute mean and var
-        noise = torch.randn_like(x) 
-        mean_pred = (
-                pred_x_start * torch.sqrt(alpha_bar_prev)
-                + torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * pred_noise
-        )
-
-        nonzero_mask = (1 - (t == 0).float()).reshape(x.shape[0], *((1,) * (len(x.shape) - 1)))
-        return mean_pred + nonzero_mask * sigma * noise, pred_x_start
-
-   
-
-    @torch.no_grad()
-    def p_sample_loop_with_input(
-        self,
-        batch,
-        init_rand=None,
-        n_diffusion_steps=-1,
-    ):
+        # 初始噪声
+        x = torch.randn((n_samples * B, T, C), device=x_0.device)
         
-        # INPUT
-        device = self.betas.device
-        x_0_pred = torch.zeros_like(batch["x_0"]).to(batch["x_0"].device)  # only used for shape
-
-    
-        # INIT PREDICTION (normal distr noise)
-        pred = torch.randn_like(x_0_pred, device=device) if init_rand is None else init_rand  # BS x T x C
-        init_noise = pred.clone()
-        pred = pred.contiguous()
-
-
-        # SAMPLE
-        assert n_diffusion_steps == len(self.ddim_timestep_seq)
-
-        # Resample (DDIM)
-        for t in tqdm(
-            reversed(range(0, n_diffusion_steps)),
-            desc="Resampled sampling loop time step",
-            total=n_diffusion_steps,
-            position=0,
-            leave=True
-        ):
-
-            batched_times = torch.full((pred.shape[0],), self.ddim_timestep_seq[t], device=pred.device, dtype=torch.long)
-            if t == 0:
-                batched_times_prev = torch.full((pred.shape[0],), 0, device=device, dtype=torch.long)
-                pred, x_0_pred = self.p_sample_ddim(
-                    x=pred, 
-                    pred_x_start_prev=x_0_pred,
-                    t=batched_times, 
-                    t_prev=batched_times_prev, 
-                    batch=batch,
-                    if_prev=True
-                )
-            else:
-                batched_times_prev = torch.full((pred.shape[0],), self.ddim_timestep_seq[t-1], device=device, dtype=torch.long)
-                pred, x_0_pred = self.p_sample_ddim(
-                    x=pred,
-                    pred_x_start_prev=x_0_pred, 
-                    t=batched_times,
-                    t_prev=batched_times_prev,
-                    batch=batch
-                )
-        return pred, init_noise
-
-
-
-    ''' Actual inference step '''
-    def predict(
-        self,
-        x_0,
-        obs,
-        mask_past,
-        masks_stages,
-        *,
-        n_samples=2,
-        return_noise=False,
-        n_diffusion_steps=-1,
-    ):
+        # 准备时间步
+        step_indices = torch.arange(self.timesteps)[::self.timesteps // n_diffusion_steps].flip(0)
         
-        # Initialize observation
-        # [注意] 这里 obs 会被重复，以匹配 parallel sampling
-        obs = repeat(obs, "b t c -> (s b) t c", s=n_samples)
-        x_0 = repeat(x_0, "b t c -> (s b) t c ", s=n_samples)
-        
-        # mask_past 在 futr.py 中其实是 future target 的 mask
-        mask_past = repeat(mask_past, "b t 1 -> (s b) t c", s=n_samples, c=obs.shape[-1])
-        masks_stages = [repeat(mask.to(torch.bool), "b t c -> (s b) t c", s=n_samples) for mask in masks_stages]
+        pred_x_start_prev = None
 
-        # Sample from the diffusion model
-        x_out, _ = self.p_sample_loop_with_input(
-            batch={
-                "x_0": x_0,  # only used for shape
-                "obs": obs,
-                "mask_past": mask_past.to(torch.bool),
-                "mask_all": masks_stages
-            },
-            init_rand=None,
-            n_diffusion_steps=n_diffusion_steps
-        )
-          
-        # Return
-        return rearrange(x_out, "(s b) t c -> s b c t", s=n_samples)
+        # 存储最终的非 Class 预测 (因为它们不参与迭代，但每一步都会预测，我们取最后一步)
+        final_offset = None
+        final_actionness = None
+
+        for t_idx in tqdm(step_indices, desc='sampling loop time step', leave=False):
+            t = torch.full((x.shape[0],), t_idx, device=x.device, dtype=torch.long)
+            
+            # 计算上一步的 t
+            t_prev_idx = t_idx - (self.timesteps // n_diffusion_steps)
+            if t_prev_idx < 0: t_prev_idx = 0 
+            t_prev = torch.full((x.shape[0],), t_prev_idx, device=x.device, dtype=torch.long)
+            
+            # 调用 p_sample_ddim
+            x, pred_x0, pred_off, pred_act = self.p_sample_ddim(
+                x, pred_x_start_prev, t, t_prev, obs, masks_stages, eta=0.
+            )
+            
+            pred_x_start_prev = pred_x0 
+            
+            final_offset = pred_off
+            final_actionness = pred_act
+            
+        # x 现在是最终去噪后的 Class
+        
+        # 拼接回 [S*B, T, 19] 格式 (Class, Offset, Actionness)
+        outputs = [x]
+        if final_offset is not None:
+            outputs.append(final_offset)
+        if final_actionness is not None:
+            outputs.append(final_actionness)
+            
+        final_res = torch.cat(outputs, dim=-1)
+        
+        # Reshape: [samples*B, T, C] -> [samples, B, T, C]
+        final_res = final_res.view(n_samples, B, T, -1)
+        
+        # permute -> [samples, B, C, T] 以兼容 futr.py 的 parsing
+        final_res = final_res.permute(0, 1, 3, 2) 
+        
+        return final_res

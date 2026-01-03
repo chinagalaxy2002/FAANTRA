@@ -48,7 +48,9 @@ def main():
     # Load checkpoint
     checkpoint = {}
     if not args.checkpoint_path is None:
-        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        # [修改] 添加 weights_only=False 以修复 PyTorch 2.6+ 的报错
+        # 因为 checkpoint 中包含了 args (argparse.Namespace)，非纯权重
+        checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
 
     # initialize wandb
     wandb.login()
@@ -173,7 +175,8 @@ def main():
     
     # Load best checkpoint and evaluate it on test dataset
     if not best_model_path == "":
-        best_checkpoint = torch.load(best_model_path, map_location=device)
+        # [修改] 同样添加 weights_only=False
+        best_checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
         model.load_state_dict(best_checkpoint)
     if args.dataset == 'soccernetballanticipation':
         eval_results, _, _ = evaluate_BAA("test", model, n_class, actions_dict, pad_idx, args, True, use_actionness=args.actionness, use_anchors=args.use_anchors)

@@ -190,6 +190,10 @@ def evaluate_BAA(split, model, n_class, classes_dict, pad_index, args, test=Fals
                     else:
                         batch_actionness = outputs['actionness'].sigmoid().detach().cpu().numpy()
                     
+                    # [修复] 压缩最后一个维度，从 (B, T, 1) -> (B, T)，以支持广播乘法
+                    if batch_actionness.ndim == 3 and batch_actionness.shape[-1] == 1:
+                        batch_actionness = batch_actionness.squeeze(-1)
+
                     # [修复] 检查形状，防止重复添加背景类
                     if batch_pred_scores.shape[-1] < n_class:
                         # 原逻辑：需要手动添加背景类（索引0）
@@ -211,6 +215,10 @@ def evaluate_BAA(split, model, n_class, classes_dict, pad_index, args, test=Fals
                     batch_pred_offsets = outputs['offset'][...,:args.n_query].detach().cpu().numpy()
                 else:
                     batch_pred_offsets = outputs['offset'].detach().cpu().numpy()
+                
+                # [修复] 压缩 Offset 维度 (B, T, 1) -> (B, T)，方便后续索引操作
+                if batch_pred_offsets.ndim == 3 and batch_pred_offsets.shape[-1] == 1:
+                    batch_pred_offsets = batch_pred_offsets.squeeze(-1)
 
                 # 转换：Query预测 -> 时间轴预测
                 batch_seg_scores = np.zeros((batch_pred_scores.shape[0], pred_len, batch_pred_scores.shape[2]), batch_pred_scores.dtype)
