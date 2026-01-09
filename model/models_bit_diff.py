@@ -5,7 +5,7 @@ import math
 from einops import rearrange
 
 # ==========================================
-# v3
+# v4 - Offset Binning Version
 # ==========================================
 try:
     from utils import *
@@ -32,11 +32,13 @@ class BitDiffPredictorTCN(nn.Module):
     def __init__(self, args, causal=False):
         super(BitDiffPredictorTCN, self).__init__()
 
-        # [修改] 解析各部分维度
-        # args.num_classes 在新逻辑下应当只包含动作类别数量 (如 17)
+        # [参数解析]
         self.num_actions = args.num_classes       
         self.offset_dim = getattr(args, 'offset_dim', 0)         
         self.actionness_dim = getattr(args, 'actionness_dim', 0) 
+        
+        # [新增] Offset Bin 数量，默认64
+        self.num_offset_bins = getattr(args, 'num_offset_bins', 64)
 
         # 这里的 num_f_maps 使用 args.model_dim (即 hidden_dim)
         self.ms_tcn = DiffMultiStageModel(
@@ -50,8 +52,9 @@ class BitDiffPredictorTCN(nn.Module):
             self.num_actions,    # num_classes (Diff Head 输出维度)
             args.channel_dropout_prob,
             args.use_features,
-            offset_dim=self.offset_dim,        # [新增] 传递 offset 维度
-            actionness_dim=self.actionness_dim # [新增] 传递 actionness 维度
+            offset_dim=self.offset_dim,        
+            actionness_dim=self.actionness_dim,
+            num_offset_bins=self.num_offset_bins # [新增] 传递 Bin 数量
         )
 
         self.use_inp_ch_dropout = args.use_inp_ch_dropout
@@ -64,9 +67,6 @@ class BitDiffPredictorTCN(nn.Module):
         x = rearrange(x, "b t c -> b c t")
         
         # [关键修复] Mask 处理
-        # stage_masks 中的 mask 可能是 [B, T, C]，但在模型内部拼接时
-        # 需要与 mask_obs [B, 1, T] 保持通道一致。
-        # 因此这里强制取第一个通道，转为 [B, 1, T]。
         if stage_masks is not None:
             new_masks = []
             for m in stage_masks:
@@ -82,19 +82,18 @@ class BitDiffPredictorTCN(nn.Module):
         if obs_cond is not None:
             obs_cond = rearrange(obs_cond, "b t c -> b c t")
         
-        # self_cond: 暂不处理复杂拼接，保持原样或忽略
+        # self_cond
         if self_cond is not None:
              self_cond = rearrange(self_cond, "b t c -> b c t")
 
         if self.use_inp_ch_dropout:
             x = self.channel_dropout(x)
 
-        # [修改] ms_tcn 现在返回一个字典，包含分离的 heads
+        # 获取输出字典
         outputs_dict = self.ms_tcn(x, t, stage_masks, obs_cond=obs_cond)
         
-        # [修改] 输出重排回 [S, B, T, C] 并处理字典
+        # 输出重排回 [S, B, T, C]
         res = {}
-        # 我们关心的 keys
         keys_to_process = ['action', 'offset', 'actionness', 'features']
         
         for key in keys_to_process:
@@ -119,11 +118,12 @@ class DiffMultiStageModel(nn.Module):
         num_classes,
         dropout,
         use_features=False,
-        offset_dim=0,      # [新增]
-        actionness_dim=0   # [新增]
+        offset_dim=0,      
+        actionness_dim=0,
+        num_offset_bins=64 # [新增]
     ):
         super(DiffMultiStageModel, self).__init__()
-        # 目前只支持单 Stage，保留结构以便扩展
+        # 目前只支持单 Stage
         self.stage1 = DiffSingleStageModel(
             layer_type,
             kernel_size,
@@ -133,16 +133,15 @@ class DiffMultiStageModel(nn.Module):
             obs_dim,
             num_classes,
             dropout,
-            offset_dim=offset_dim,         # [新增]
-            actionness_dim=actionness_dim  # [新增]
+            offset_dim=offset_dim,         
+            actionness_dim=actionness_dim,
+            num_offset_bins=num_offset_bins # [新增]
         )
 
     def forward(self, x, t, stage_masks, obs_cond=None):
-        # [修改] 接收字典返回
         out_dict = self.stage1(x, t, stage_masks[0], obs_cond=obs_cond)
         
-        # 为每个输出增加 stage 维度 (虽然这里只有1个stage)
-        # 输入格式 [B, C, T] -> 输出 [1, B, C, T]
+        # 增加 stage 维度
         outputs = {}
         for k, v in out_dict.items():
             if v is not None:
@@ -163,8 +162,9 @@ class DiffSingleStageModel(nn.Module):
         obs_dim,     
         num_classes,
         dropout,
-        offset_dim=0,    # [新增]
-        actionness_dim=0 # [新增]
+        offset_dim=0,    
+        actionness_dim=0,
+        num_offset_bins=64 # [新增]
     ):
         super(DiffSingleStageModel, self).__init__()
 
@@ -172,8 +172,6 @@ class DiffSingleStageModel(nn.Module):
             "mamba": DiffMambaResidualLayer,
         }
 
-        # [修改] 分别定义投影层
-        # x_dim 现在只包含 class 信息 (如 17)
         self.x_proj = nn.Conv1d(x_dim, num_f_maps, 1)
         self.obs_proj = nn.Conv1d(obs_dim, num_f_maps, 1)
 
@@ -208,21 +206,22 @@ class DiffSingleStageModel(nn.Module):
 
         # [修改] 定义分离的 Head
         
-        # 1. Class Head (用于 Diffusion)
+        # 1. Class Head (Diffusion)
         self.cls_head = nn.Conv1d(num_f_maps, num_classes, 1)
         
-        # 2. Offset Head (独立 MLP: Conv1d 1x1 实际上就是逐点 MLP)
+        # 2. Offset Head (改为分类 Head)
         self.offset_dim = offset_dim
         if offset_dim > 0:
             self.offset_head = nn.Sequential(
                 nn.Conv1d(num_f_maps, num_f_maps, 1),
                 nn.GELU(),
-                nn.Conv1d(num_f_maps, offset_dim, 1)
+                # [关键修改] 输出维度变成 num_offset_bins (例如 64)
+                nn.Conv1d(num_f_maps, num_offset_bins, 1) 
             )
         else:
             self.offset_head = None
             
-        # 3. Actionness Head (独立 MLP)
+        # 3. Actionness Head (保持回归)
         self.actionness_dim = actionness_dim
         if actionness_dim > 0:
             self.actionness_head = nn.Sequential(
@@ -234,25 +233,20 @@ class DiffSingleStageModel(nn.Module):
             self.actionness_head = None
 
     def forward(self, x, t, mask, obs_cond=None):
-        # x: [B, C_x, T_future] (Noisy input, only Class)
-        # obs_cond: [B, C_obs, T_past] (Condition)
-        # mask: [B, 1, T_future] (已确保为单通道)
+        # x: [B, C_x, T_future]
+        # obs_cond: [B, C_obs, T_past]
         
         # 1. 投影
-        x_emb = self.x_proj(x) # [B, D, T_future]
+        x_emb = self.x_proj(x)
         
         # 2. Time-Concat 拼接
         if obs_cond is not None:
-            obs_emb = self.obs_proj(obs_cond) # [B, D, T_past]
-            
-            # 在时间维度拼接 (dim=2) -> [B, D, T_past + T_future]
+            obs_emb = self.obs_proj(obs_cond)
             h = torch.cat([obs_emb, x_emb], dim=2)
             
             # 处理 Mask
             B, _, T_past = obs_emb.shape
             mask_obs = torch.ones((B, 1, T_past), device=x.device)
-            
-            # [B, 1, T_past + T_future]
             mask_combined = torch.cat([mask_obs, mask], dim=2)
         else:
             h = x_emb
@@ -261,23 +255,22 @@ class DiffSingleStageModel(nn.Module):
         # 3. Time Embedding
         time = self.time_mlp(t)
 
-        # 4. Pass through Layers
+        # 4. Layers
         out = h
         for layer in self.layers:
             out = layer(out, time, mask_combined)
 
-        # 5. 切片 (Slice)
-        # 只保留对应 Future 的部分用于预测和 Loss 计算
+        # 5. 切片
         T_future = x.shape[2]
-        out_future = out[:, :, -T_future:] # 取最后 T_future 帧
+        out_future = out[:, :, -T_future:] 
 
-        # 6. Output Projection (分离头)
+        # 6. Output Projection
         out_features = out_future * mask
         
         # (1) Class Prediction
         out_cls = self.cls_head(out_future) * mask
         
-        # (2) Offset Prediction
+        # (2) Offset Prediction (logits for bins)
         out_off = None
         if self.offset_head is not None:
             out_off = self.offset_head(out_future) * mask
@@ -338,9 +331,8 @@ class DiffMambaResidualLayer(nn.Module):
             )
 
     def forward(self, x, t, mask):
-        # x: [B, C, T]
-        x_in = x.permute(0, 2, 1) # B T C
-        mask_in = mask.permute(0, 2, 1) # B T C
+        x_in = x.permute(0, 2, 1)
+        mask_in = mask.permute(0, 2, 1)
         
         mamba_in = self.norm(x_in) * mask_in
 

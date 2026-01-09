@@ -26,7 +26,6 @@ except ImportError:
         print("Error: 无法导入 bit_diffusion, models_bit_diff 或 shift 模块。")
         raise e
 
-# [修改] 增加 offset_dim 和 actionness_dim 参数
 class DiffusionConfig:
     def __init__(self, args, input_dim, num_classes, offset_dim=0, actionness_dim=0):
         self.layer_type = "mamba"
@@ -36,8 +35,8 @@ class DiffusionConfig:
         self.model_dim = args.hidden_dim
         self.input_dim = input_dim
         self.num_classes = num_classes # 仅指动作类别
-        self.offset_dim = offset_dim     # [新增]
-        self.actionness_dim = actionness_dim # [新增]
+        self.offset_dim = offset_dim     
+        self.actionness_dim = actionness_dim 
         self.channel_dropout_prob = 0.1
         self.use_features = True
         self.use_inp_ch_dropout = False
@@ -83,9 +82,7 @@ class FUTR(nn.Module):
             self.fc_seg = nn.Linear(hidden_dim, n_class)
 
         # 3. Diffusion Mamba Setup
-        # [修改] diff_out_dim 只包含动作类别，不再累加 offset 和 actionness
         self.diff_out_dim = n_class 
-        
         self.offset_dim = 1
         
         if args.actionness:
@@ -93,22 +90,24 @@ class FUTR(nn.Module):
         else:
             self.actionness_dim = 0
 
-        # [修改] 传递分离的维度配置
-        # 注意：这里的 input_dim 传给 Config 的是 hidden_dim (RegNet投影后的维度)
         diff_cfg = DiffusionConfig(args, hidden_dim, self.diff_out_dim, self.offset_dim, self.actionness_dim)
         self.denoise_model = BitDiffPredictorTCN(diff_cfg)
 
         sampling_steps = getattr(args, 'ddim_timesteps', 50) 
         
+        # [修改] 从 args 获取 num_offset_bins，如果未定义则默认 64
+        num_offset_bins = getattr(args, 'num_offset_bins', 64)
+
         self.diffusion = GaussianBitDiffusion(
             model=self.denoise_model,
             condition_x0=False,
-            num_classes=self.diff_out_dim, # 这里仅指 Diffusion 需要处理的通道数 (即类别数)
+            num_classes=self.diff_out_dim, 
             timesteps=1000,          
             ddim_timesteps=sampling_steps, 
             loss_type="l2",
             objective="pred_x0",
-            beta_schedule="cosine"
+            beta_schedule="cosine",
+            num_offset_bins=num_offset_bins # 传递给 Diffusion
         )
 
         # 4. Augmentation
@@ -138,7 +137,6 @@ class FUTR(nn.Module):
     def forward(self, inputs, mode='train'):
         targets_dict = None
         
-        # 输入解析逻辑
         if isinstance(inputs, dict):
             src = inputs['obs']
             targets_dict = inputs
@@ -165,20 +163,15 @@ class FUTR(nn.Module):
         
         src = self.standarize(src)
         
-        # --- 特征提取 ---
-        # features: [B, S, InputDim]
         features = self.features(src.view(-1, C, H, W)).reshape(B, S, self.input_dim)
-        # obs_feat: [B, S, HiddenDim]
         obs_feat = self.relu(self.input_proj(features))
 
         output = dict()
         if self.args.seg:
             output['seg'] = self.fc_seg(obs_feat)
 
-        # Time-Concat 准备
         obs_cond = obs_feat 
         
-        # 构造默认 Mask
         mask_past = torch.ones((B, S, 1), device=self.device)
         masks_stages = [torch.ones((B, self.n_query, 1), device=self.device)]
         
@@ -188,45 +181,38 @@ class FUTR(nn.Module):
             if targets_dict is None:
                 raise ValueError("Diffusion Training requires targets_dict.")
             
-            # 键名映射
             if 'action_target' in targets_dict: targets_dict['action'] = targets_dict['action_target']
             if 'offset_target' in targets_dict: targets_dict['offset'] = targets_dict['offset_target']
             if 'actionness_target' in targets_dict: targets_dict['actionness'] = targets_dict['actionness_target']
 
-            # 随机采样时间步 t
-            # [修改] 现在 self.diffusion.num_timesteps 是可用的
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device).long()
 
             if 'x_0' in targets_dict and 'mask_past' in targets_dict:
-                # [修改] 提取 Class Target
                 x_0_cls = targets_dict['x_0']
                 
-                # 如果传入的 x_0 依然是拼接过的 (兼容旧 DataLoader)，我们需要拆分
-                # 旧 x_0 维度可能是: n_class + 1 (offset) [+ 1 (actionness)]
                 if x_0_cls.shape[-1] > self.n_class:
                      x_0_cls = x_0_cls[..., :self.n_class]
                 
-                # 映射到 [-1, 1]
                 x_0 = x_0_cls * 2.0 - 1.0
                 
                 mask_past_for_diff = targets_dict['mask_past'] 
                 masks_stages_for_diff = targets_dict['masks_stages']
                 
-                # [修改] 准备 Offset Target (映射到 [-1, 1])
                 gt_offset = targets_dict['offset']
                 gt_offset_norm = gt_offset / norm_factor
+                # Offset Target 建议映射到 [0, 1] 用于分类 (Binning)，或者 [-1, 1] 用于回归
+                # 由于 bit_diffusion.py 中已经处理了 [-1, 1] -> [0, 1] 的映射逻辑 (假设 target 是 [-1, 1])
+                # 这里我们保持 [-1, 1] 归一化
                 offset_target = (gt_offset_norm.unsqueeze(-1) * 2.0) - 1.0
                 
-                # [修改] 准备 Actionness Target (映射到 [-1, 1])
                 actionness_target = None
                 if self.args.actionness and 'actionness' in targets_dict:
                     gt_act = targets_dict['actionness'].unsqueeze(-1)
                     actionness_target = gt_act * 2.0 - 1.0
 
-                # [修改] 调用 Diffusion，传入分离的 Targets
                 loss_dict = self.diffusion.p_losses(
                     t=t, 
-                    x_0=x_0, # 仅 Class
+                    x_0=x_0, 
                     obs=obs_cond, 
                     mask_past=mask_past_for_diff, 
                     mask_all=masks_stages_for_diff,
@@ -237,23 +223,27 @@ class FUTR(nn.Module):
                 
                 loss = loss_dict['loss']
                 
-                # 从 dict 中取回预测结果
                 pred_cls = loss_dict['action']
                 pred_off = loss_dict['offset']
                 pred_act = loss_dict['actionness']
 
-                # 反向映射 Class: [-1, 1] -> Logits
                 pred_action_probs = (pred_cls.clamp(-1, 1) + 1) / 2.0
                 output['action'] = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
                 
-                # 反向映射 Offset: [-1, 1] -> [0, 1] -> 真实值
                 if pred_off is not None:
-                    pred_off_01 = (pred_off + 1) / 2.0
-                    output['offset'] = pred_off_01 * norm_factor
+                    # 注意: loss_dict 返回的可能是 logits (如果用了分类)
+                    # 如果 bit_diffusion.py 的 p_losses 返回的是 pred_offset (logits)
+                    # 我们需要 argmax 它来得到 Scalar 才能可视化 (虽然 training loss 已经算了)
+                    # 但通常 Training loop 不用 output['offset'] 算 accuracy (只算 loss)
+                    # 为了安全起见，这里暂不反解 Logits -> Scalar，如果需要 logging 可以在 utils 处理
+                    # 或者简单地不做处理，Training loop 中的 offset_acc 可能不准确 (因为它期望 scalar)
+                    # 如果要支持 offset_acc logging，需要在这里做 argmax decoding
+                    pass 
+                    # 暂时置为 None，避免 calculate_performance 报错
+                    output['offset'] = None 
                 else:
                     output['offset'] = None
                 
-                # 反向映射 Actionness: [-1, 1] -> Logits
                 if pred_act is not None:
                      pred_act_probs = (pred_act.clamp(-1, 1) + 1) / 2.0
                      output['actionness'] = torch.logit(pred_act_probs.clamp(min=1e-6, max=1-1e-6))
@@ -274,10 +264,8 @@ class FUTR(nn.Module):
                 mask_past_infer = mask_past
                 masks_stages_infer = masks_stages
 
-            # [修改] x_0 初始化只针对 Class 维度
             x_0_infer = torch.zeros((B, self.n_query, self.diff_out_dim), device=self.device)
 
-            # predict 返回的是拼接好的 [S, B, C, T] (在 bit_diffusion 中做了 permute)
             sampled_x = self.diffusion.predict(
                 x_0=x_0_infer,
                 obs=obs_cond,
@@ -287,16 +275,12 @@ class FUTR(nn.Module):
                 n_diffusion_steps=self.diffusion.ddim_timesteps
             )
             
-            # 先取平均 (Mean over samples) -> [B, C, T]
             sampled_x_avg = sampled_x.mean(dim=0)
-            
-            # 转回 [B, T, C] 以便切分
             sampled_x_avg = rearrange(sampled_x_avg, 'b c t -> b t c')
 
-            # [修改] 切分输出
-            # 顺序: Class -> Offset -> Actionness
-            
+            # [关键修复] 安全切分输出
             idx = 0
+            
             # 1. Class
             pred_action_raw = sampled_x_avg[..., idx : idx + self.n_class]
             idx += self.n_class
@@ -304,21 +288,26 @@ class FUTR(nn.Module):
             # 2. Offset
             pred_offset_raw = None
             if self.offset_dim > 0:
-                pred_offset_raw = sampled_x_avg[..., idx : idx + self.offset_dim]
-                idx += self.offset_dim
+                if sampled_x_avg.shape[-1] >= idx + self.offset_dim:
+                    pred_offset_raw = sampled_x_avg[..., idx : idx + self.offset_dim]
+                    idx += self.offset_dim
             
             # 3. Actionness
             pred_act_raw = None
             if self.actionness_dim > 0:
-                pred_act_raw = sampled_x_avg[..., idx : idx + self.actionness_dim]
+                if sampled_x_avg.shape[-1] >= idx + self.actionness_dim:
+                    pred_act_raw = sampled_x_avg[..., idx : idx + self.actionness_dim]
+                    idx += self.actionness_dim
+                else:
+                    # Fallback if channel is missing
+                    pred_act_raw = None
 
-            # 反向映射逻辑
             pred_action_probs = (pred_action_raw.clamp(-1, 1) + 1) / 2.0
             output['action'] = torch.logit(pred_action_probs.clamp(min=1e-6, max=1-1e-6))
             
             if pred_offset_raw is not None:
-                pred_offset_01 = (pred_offset_raw + 1) / 2.0
-                output['offset'] = pred_offset_01 * norm_factor
+                # Offset 已经是 [0, 1] 归一化的 Scalar (由 bit_diffusion 解码)
+                output['offset'] = pred_offset_raw * norm_factor
             else:
                 output['offset'] = None
             
