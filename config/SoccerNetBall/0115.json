@@ -12,12 +12,12 @@
     "eos_weight": 0.1,
     "offset_loss_weight": 10,
     "epoch_num_frames": 500000,
-    "feature_arch": "rny004_gsf",
+    "feature_arch": "videomae_base",
     "learning_rate": 0.0001,
     "num_epochs": 30,
     "warm_up_epochs": 3,
     "start_map_epoch": 10,
-    "temporal_arch": "none",
+    "temporal_arch": "uniformer",
     "n_layers": 2,
     "sgp_ks": 9,
     "sgp_r": 4,
@@ -38,5 +38,6 @@
     "mask_attn_window_src": 15,
     "mask_attn_window_tgt": 19,
     "wandb_mode": "online",
+    "contrastive_weight": 0.1,
     "use_jointtrain": false
 }

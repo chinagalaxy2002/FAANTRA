@@ -7,8 +7,69 @@ import abc
 import torch
 import torch.nn as nn
 import math
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 #Local imports
+
+class CMlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Conv1d(in_features, hidden_features, 1)
+        self.act = act_layer()
+        self.fc2 = nn.Conv1d(hidden_features, out_features, 1)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class CBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.pos_embed = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.norm1 = norm_layer(dim)
+        self.conv1 = nn.Conv1d(dim, dim, 1)
+        self.conv2 = nn.Conv1d(dim, dim, 1)
+        self.attn = nn.Conv1d(dim, dim, 5, padding=2, groups=dim) 
+        
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = CMlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.pos_embed(x)
+        # Note: input x is [B, C, T]. LayerNorm expects [B, T, C]. Transpose needed.
+        x = x + self.drop_path(self.conv2(self.attn(self.conv1(self.norm1(x.transpose(1, 2)).transpose(1, 2)))))
+        x = x + self.drop_path(self.mlp(self.norm2(x.transpose(1, 2)).transpose(1, 2)))
+        return x
+
+class UniFormerNeck(nn.Module):
+    """
+    Simplified UniFormer Neck specifically for Temporal Aggregation
+    Replaces EDSGPMIXERLayers
+    """
+    def __init__(self, input_dim, max_len, num_layers=4, num_heads=8):
+        super().__init__()
+        self.input_dim = input_dim
+        self.layers = nn.ModuleList([])
+        for _ in range(num_layers):
+            self.layers.append(CBlock(dim=input_dim, num_heads=num_heads, drop_path=0.1))
+            
+    def forward(self, x):
+        # x: [B, T, C] -> [B, C, T] for Conv1d operations in CBlock
+        x = x.transpose(1, 2)
+        for layer in self.layers:
+            x = layer(x)
+        # Back to [B, T, C]
+        x = x.transpose(1, 2)
+        return x
 
 class EDSGPMIXERLayers(nn.Module):
     def __init__(self, feat_dim, clip_len, num_layers=1, ks=3, k=2, k_factor = 2, concat = True):

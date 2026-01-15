@@ -33,7 +33,9 @@ def update_args(args, config):
     args.n_layers = config['n_layers']  # Number of layers to use in temporal architecture. Does not apply to the transformer
     args.sgp_ks = config['sgp_ks']  # Kernel size of the SGP and SGP-Mixer layers
     args.sgp_r = config['sgp_r']    # r factor in SGP and SGP-Mixer layers
-
+    # --- 新增：读取对比学习权重 ---
+    # 如果配置文件里没有写，默认给 0.1
+    args.contrastive_weight = config.get("contrastive_weight", 0.1)
     args.num_workers = config['num_workers']    # Number of workers to use for data loading
     # Load the dual training arguments
     if 'jointtrain' in config and config['use_jointtrain'] :
