@@ -49,7 +49,7 @@ def main():
     # Load checkpoint
     checkpoint = {}
     if not args.checkpoint_path is None:
-        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
 
     # initialize wandb
     wandb.login()

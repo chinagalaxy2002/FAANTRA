@@ -45,6 +45,9 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
         total_seg_correct = 0
         train_loop = tqdm(train_loader)
         for i, data in enumerate(train_loop):
+            # if i >= 5:
+            #     print("【DEBUG模式】强制跳出训练循环，进入验证阶段...")
+            #     break 
             step_log_dict = {"train/step": epoch*len(train_loader) + i+1}
             postfix_kwargs = {"loss": 0}
             optimizer.zero_grad()
